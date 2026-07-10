@@ -27,8 +27,9 @@ class MockDongle:
         self.total_connections = 0
         self.concurrent = 0
         self.max_concurrent = 0
-        self.drop_next = 0    # simulate this many missing replies (timeouts)
-        self.delay_next = 0.0  # delay the next reply by this many seconds (late reply)
+        self.drop_next = 0       # simulate this many missing replies (timeouts)
+        self.delay_next = 0.0     # delay the next reply by this many seconds (late reply)
+        self.duplicate_next = 0   # send the next FC03 reply twice (leftover -> off-by-one desync)
         self._server: Optional[asyncio.AbstractServer] = None
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> "MockDongle":
@@ -81,7 +82,11 @@ class MockDongle:
         if fc == 0x03:
             _, start, qty = framing.parse_fc03_request(frame)
             vals = [self.registers.get(start + i, 0) for i in range(qty)]
-            writer.write(framing.build_fc03_response(unit, vals))
+            resp = framing.build_fc03_response(unit, vals)
+            writer.write(resp)
+            if self.duplicate_next > 0:
+                self.duplicate_next -= 1
+                writer.write(resp)  # extra leftover frame -> off-by-one desync in the reader
         elif fc == 0x06:
             addr = (frame[2] << 8) | frame[3]
             self.registers[addr] = (frame[4] << 8) | frame[5]

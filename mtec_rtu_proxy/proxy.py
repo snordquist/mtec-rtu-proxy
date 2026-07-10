@@ -108,12 +108,21 @@ class Upstream:
                 self.writer.write(req)
                 await self.writer.drain()
                 reply = await asyncio.wait_for(self._read_reply(), self.cfg.txn_timeout)
-                if framing.crc_ok(reply):
+                if not framing.crc_ok(reply):
+                    if not fut.done():
+                        fut.set_exception(IOError("bad CRC from dongle"))
+                elif not framing.reply_matches(req, reply):
+                    # off-by-one desync: a valid frame but for the wrong request.
+                    # RTU has no txn id, so drop the socket to force a clean resync.
+                    log.warning("reply/request mismatch (RTU desync) -> dropping upstream to resync")
+                    self._drop()
+                    if not fut.done():
+                        fut.set_exception(IOError("desync"))
+                    await asyncio.sleep(self.cfg.reconnect_backoff)
+                else:
                     self._cache_from(req, reply)
                     if not fut.done():
                         fut.set_result(reply)
-                elif not fut.done():
-                    fut.set_exception(IOError("bad CRC from dongle"))
             except asyncio.TimeoutError:
                 # RTU has no transaction ids: a late reply arriving after the timeout
                 # would shift every subsequent read (permanent desync). The only safe

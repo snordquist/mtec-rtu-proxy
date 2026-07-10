@@ -100,3 +100,16 @@ def test_describe_request_and_reply():
     assert framing.describe_request(bytes([0x06, 0x61, 0xB3, 0x03, 0xE8])) == "FC06 write @25011=1000"
     assert framing.describe_reply(bytes([0x03, 0x02, 0x24, 0xFE])) == "FC03 -> [9470]"
     assert framing.describe_reply(bytes([0x83, 0x0B])) == "EXCEPTION fc03 code=0x0B"
+
+
+def test_reply_matches_detects_desync():
+    req2 = framing.append_crc(bytes([252, 0x03, 0, 100, 0, 2]))  # read qty 2
+    assert framing.reply_matches(req2, framing.build_fc03_response(252, [11, 22]))
+    # a valid frame for the WRONG quantity (off-by-one desync) must be rejected
+    assert not framing.reply_matches(req2, framing.build_fc03_response(252, [11, 22, 33]))
+    # an exception is a valid response to the request
+    assert framing.reply_matches(req2, framing.build_exception(252, 0x03, 0x0B))
+    # write reply must echo the address
+    wreq = framing.append_crc(bytes([252, 0x06, 0x61, 0xB3, 0x03, 0xE8]))
+    assert framing.reply_matches(wreq, wreq)
+    assert not framing.reply_matches(wreq, framing.append_crc(bytes([252, 0x06, 0x00, 0x01, 0x03, 0xE8])))

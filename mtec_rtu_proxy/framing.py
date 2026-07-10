@@ -176,6 +176,30 @@ def describe_request(pdu: bytes) -> str:
     return f"FC{fc:02X}({pdu.hex()})"
 
 
+def reply_matches(req: bytes, reply: bytes) -> bool:
+    """Best-effort check that an RTU reply belongs to its request.
+
+    RTU-over-TCP has no transaction id, so a stream that ever shifts by one
+    frame stays silently mis-paired (every reply belongs to the *previous*
+    request) with valid CRCs and no timeout. Detect that here: an FC03 reply's
+    byte count must equal 2x the requested quantity, and a write reply must echo
+    the request's start address. Mismatch => desync => caller should reconnect.
+    """
+    if len(req) < 4 or len(reply) < 4:
+        return False
+    rfc, pfc = req[1], reply[1]
+    if pfc & 0x80:  # an exception is a valid response to a request of the same fc
+        return (pfc & 0x7F) == rfc
+    if pfc != rfc:
+        return False
+    if rfc == 0x03:  # read holding: byte count must be 2 * requested quantity
+        qty = (req[4] << 8) | req[5]
+        return len(reply) >= 3 and reply[2] == 2 * qty
+    if rfc in (0x06, 0x10):  # write single/multiple: reply echoes the start address
+        return reply[2:4] == req[2:4]
+    return True
+
+
 def describe_reply(pdu: bytes) -> str:
     """One-line summary of a reply PDU (function code + data)."""
     fc = pdu[0] if pdu else 0
