@@ -1,0 +1,17 @@
+# secrets / local runtime config -- NEVER commit real hosts, IPs or credentials
+.env
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

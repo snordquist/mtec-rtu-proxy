@@ -1,0 +1,9 @@
+services:
+  mtec-rtu-proxy:
+    build: .
+    image: mtec-rtu-proxy:local
+    container_name: mtec-rtu-proxy
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${LISTEN_PORT:-502}:${LISTEN_PORT:-502}"

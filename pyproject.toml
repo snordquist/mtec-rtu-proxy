@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtec-rtu-proxy"
+version = "0.1.0"
+description = "Single-master, caching RTU-over-TCP proxy for M-TEC 'espressif' Modbus dongles"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "snordquist" }]
+keywords = ["modbus", "rtu", "proxy", "m-tec", "energy-butler", "solar", "home-assistant"]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/snordquist/mtec-rtu-proxy"
+
+[project.scripts]
+mtec-rtu-proxy = "mtec_rtu_proxy.__main__:main"
+
+[tool.setuptools]
+packages = ["mtec_rtu_proxy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
