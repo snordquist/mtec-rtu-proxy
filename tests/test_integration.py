@@ -225,8 +225,9 @@ def test_mute_onset_and_recovery_are_logged(caplog):
     recovers = [m for m in msgs if "MUTE RECOVERED" in m]
     assert len(onsets) == 1, msgs           # onset logged exactly once per streak
     assert "trail:" in onsets[0]            # lead-in context is dumped
+    assert "R100:1" in onsets[0]            # the hung/preceding request is shown, not just "a line"
     assert len(recovers) == 1, msgs         # recovery logged once when it heals
-    assert "timeouts=" in onsets[0]  or "livereq_1s" in onsets[0]
+    assert "/ 3 timeouts" in recovers[0], recovers  # real streak count, not a constant-true check
 
 
 async def _scenario_mute_log():
@@ -250,6 +251,168 @@ async def _scenario_mute_log():
             await asyncio.sleep(0.1)
         else:
             raise AssertionError("dongle never recovered")
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+# --- write authorization: only WRITE_IPS may command the inverter ----------
+
+def test_unauthorized_write_is_rejected():
+    asyncio.run(_scenario_write_denied())
+
+
+async def _scenario_write_denied():
+    dongle = await MockDongle({100: 0}).start()
+    # localhost is NOT in write_ips -> the write must be refused, never reaching the dongle
+    proxy = await ProxyServer(_cfg(dongle.port, write_ips=frozenset({"10.0.0.1"}))).start()
+    try:
+        r = await client_request(proxy.port, _fc06(252, 100, 1234))
+        assert r[1] == 0x86 and r[2] == 0x01   # FC06|0x80, illegal function (unauthorized)
+        assert dongle.registers[100] == 0       # write blocked before the dongle
+        assert dongle.request_count == 0
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+def test_authorized_write_is_forwarded():
+    asyncio.run(_scenario_write_allowed())
+
+
+async def _scenario_write_allowed():
+    dongle = await MockDongle({100: 0}).start()
+    proxy = await ProxyServer(_cfg(dongle.port, write_ips=frozenset({"127.0.0.1"}))).start()
+    try:
+        echo = await client_request(proxy.port, _fc06(252, 100, 1234))
+        assert echo == _fc06(252, 100, 1234)
+        assert dongle.registers[100] == 1234
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+# --- cache coherence: a write must invalidate/update the cached value -------
+
+def test_write_updates_cache_no_stale_read():
+    asyncio.run(_scenario_cache_write_coherence())
+
+
+async def _scenario_cache_write_coherence():
+    dongle = await MockDongle({100: 0}).start()
+    # hero_ips empty -> reads are cache-served; write_ips empty -> writes allowed
+    proxy = await ProxyServer(_cfg(dongle.port)).start()
+    try:
+        assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 1)))[1] == [0]
+        assert dongle.request_count == 1
+        assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 1)))[1] == [0]
+        assert dongle.request_count == 1                 # second read served from cache
+        await client_request(proxy.port, _fc06(252, 100, 1234))  # write must refresh the cache
+        r = await client_request(proxy.port, _fc03(252, 100, 1))
+        assert framing.parse_fc03_response(r)[1] == [1234]  # NOT the stale cached 0
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+# --- FC03 quantity out of range -> exception, never reaches the dongle ------
+
+def test_fc03_quantity_out_of_range_is_rejected():
+    asyncio.run(_scenario_qty_guard())
+
+
+async def _scenario_qty_guard():
+    dongle = await MockDongle({100: 5}).start()
+    proxy = await ProxyServer(_cfg(dongle.port)).start()
+    try:
+        for qty in (0, 200):  # 0 (vacuous) and >125 (over FC03 limit / byte-count overflow)
+            r = await client_request(proxy.port, _fc03(252, 100, qty))
+            assert r[1] == 0x83 and r[2] == 0x03   # illegal data value
+        assert dongle.request_count == 0
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+# --- healthy path never pays the drain tax ---------------------------------
+
+def test_healthy_path_does_not_drain():
+    asyncio.run(_scenario_no_drain())
+
+
+async def _scenario_no_drain():
+    dongle = await MockDongle({100: 7, 101: 8}).start()
+    proxy = await ProxyServer(_cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}))).start()
+    try:
+        for _ in range(5):
+            await client_request(proxy.port, _fc03(252, 100, 2))
+        assert proxy.up.n_drain == 0   # aligned stream -> no blocking drain, no latency tax
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+# --- Hero priority: a hero read jumps ahead of a queued HA backlog ----------
+
+def test_hero_read_jumps_queued_backlog():
+    asyncio.run(_scenario_priority())
+
+
+async def _scenario_priority():
+    from mtec_rtu_proxy.proxy import Upstream, PRIO_HERO, PRIO_OTHER
+    from mtec_rtu_proxy.cache import RegisterCache
+    dongle = await MockDongle({i: i for i in range(100, 140)}).start()
+    cfg = _cfg(dongle.port)
+    up = Upstream(cfg, RegisterCache(ttl=cfg.cache_ttl))
+    worker = asyncio.create_task(up.worker())
+    try:
+        await asyncio.sleep(0.05)          # let the upstream connect
+        dongle.delay_next = 0.5            # block the worker on the first in-flight reply
+        first = asyncio.create_task(up.submit(_fc03(252, 100, 1), PRIO_OTHER))
+        await asyncio.sleep(0.05)          # worker now busy on `first`
+        lows = [asyncio.create_task(up.submit(_fc03(252, 110 + i, 1), PRIO_OTHER)) for i in range(5)]
+        await asyncio.sleep(0.02)
+        hero = asyncio.create_task(up.submit(_fc03(252, 130, 1), PRIO_HERO))
+        await asyncio.gather(first, *lows, hero)
+        starts = [s for (_fc, s) in dongle.requests]
+        assert starts[0] == 100            # the in-flight request
+        assert starts[1] == 130            # hero jumped ahead of the 5 queued HA reads
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        await up.aclose()
+        await dongle.stop()
+
+
+# --- reconnect after a real socket death (not a transient timeout) ----------
+
+def test_reconnect_after_socket_death():
+    asyncio.run(_scenario_socket_death())
+
+
+async def _scenario_socket_death():
+    dongle = await MockDongle({100: 55}).start()
+    proxy = await ProxyServer(
+        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), txn_timeout=0.4, reconnect_backoff=0.1)
+    ).start()
+    try:
+        assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 1)))[1] == [55]
+        conns = dongle.total_connections
+        dongle.close_next = 1  # the next upstream request kills the socket
+        r = await client_request(proxy.port, _fc03(252, 100, 1), timeout=4)
+        assert r[1] == 0x83    # in-flight txn -> gateway exception
+        ok = False
+        for _ in range(20):
+            rr = await client_request(proxy.port, _fc03(252, 100, 1), timeout=4)
+            if len(rr) >= 5 and rr[1] == 0x03 and framing.parse_fc03_response(rr)[1] == [55]:
+                ok = True
+                break
+            await asyncio.sleep(0.15)
+        assert ok
+        assert dongle.total_connections > conns  # a real reconnect happened
     finally:
         await proxy.stop()
         await dongle.stop()

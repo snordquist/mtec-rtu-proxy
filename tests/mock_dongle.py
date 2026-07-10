@@ -24,12 +24,14 @@ class MockDongle:
         self.registers: Dict[int, int] = dict(registers or {})
         self.single_master = single_master
         self.request_count = 0
+        self.requests = []       # (fc, start_addr) per received request, in arrival order
         self.total_connections = 0
         self.concurrent = 0
         self.max_concurrent = 0
         self.drop_next = 0       # simulate this many missing replies (timeouts)
         self.delay_next = 0.0     # delay the next reply by this many seconds (late reply)
         self.duplicate_next = 0   # send the next FC03 reply twice (leftover -> off-by-one desync)
+        self.close_next = 0       # close the socket on the next N requests (real socket death)
         self._server: Optional[asyncio.AbstractServer] = None
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> "MockDongle":
@@ -69,6 +71,12 @@ class MockDongle:
 
     async def _respond(self, frame: bytes, writer: asyncio.StreamWriter) -> None:
         self.request_count += 1
+        if len(frame) >= 4:
+            self.requests.append((frame[1], (frame[2] << 8) | frame[3]))
+        if self.close_next > 0:
+            self.close_next -= 1
+            writer.close()  # real socket death -> proxy must reconnect
+            raise ConnectionResetError("mock dongle closed the connection")
         if self.drop_next > 0:
             self.drop_next -= 1
             return  # no reply -> the proxy will time out on this transaction

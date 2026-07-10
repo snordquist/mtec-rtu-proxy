@@ -10,16 +10,32 @@ any I/O.
 """
 from __future__ import annotations
 
+import struct
 from typing import List, Tuple
 
 
-def crc16(data: bytes) -> int:
-    """Modbus CRC-16 (poly 0xA001). On the wire the low byte goes first."""
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
+def _make_crc_table() -> List[int]:
+    table = []
+    for byte in range(256):
+        crc = byte
         for _ in range(8):
             crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+
+_CRC_TABLE = _make_crc_table()  # computed once at import
+
+
+def crc16(data: bytes) -> int:
+    """Modbus CRC-16 (poly 0xA001). On the wire the low byte goes first.
+
+    Table-driven (one lookup per byte) instead of the bitwise inner loop -- same
+    result, ~8x fewer interpreter ops per frame on the hot path.
+    """
+    crc = 0xFFFF
+    for b in data:
+        crc = (crc >> 8) ^ _CRC_TABLE[(crc ^ b) & 0xFF]
     return crc
 
 
@@ -35,10 +51,13 @@ def crc_ok(frame: bytes) -> bool:
 
 
 def build_fc03_response(unit: int, values: List[int]) -> bytes:
-    """Build a Read-Holding-Registers (FC03) response frame (incl. CRC)."""
-    body = bytes([unit, 0x03, len(values) * 2])
-    for v in values:
-        body += bytes([(v >> 8) & 0xFF, v & 0xFF])
+    """Build a Read-Holding-Registers (FC03) response frame (incl. CRC).
+
+    Callers must ensure ``len(values) <= 125`` (Modbus FC03 max); the byte-count
+    field is a single byte, so more would overflow. serve()/serve_mbap() reject
+    out-of-range quantities before reaching here.
+    """
+    body = bytes([unit, 0x03, len(values) * 2]) + struct.pack(">%dH" % len(values), *values)
     return append_crc(body)
 
 
@@ -77,10 +96,17 @@ def take_requests(buf: bytearray) -> List[bytes]:
             del buf[:8]
             out.append(frame)
         elif fc == 0x10:  # write multiple: unit,fc,start(2),qty(2),bytecount,data,crc(2)
+            qty = (buf[4] << 8) | buf[5]
             byte_count = buf[6]
+            # Sanity-gate before waiting: a real FC16 header has byte_count == 2*qty
+            # (1..123 regs). An implausible byte_count is garbage from a desync -- drop
+            # one byte to resync instead of stalling for a bogus (possibly huge) length.
+            if byte_count != 2 * qty or not (1 <= qty <= 123):
+                del buf[:1]
+                continue
             total = 9 + byte_count
             if len(buf) < total:
-                break  # wait for the rest of the frame
+                break  # plausible header, wait for the rest of the frame
             frame = bytes(buf[:total])
             if not crc_ok(frame):
                 del buf[:1]
@@ -123,10 +149,18 @@ def detect_dialect(buf: bytes):
     fc = buf[1]
     if fc in (0x03, 0x06) and crc_ok(bytes(buf[:8])):
         return "rtu"
-    if fc == 0x10 and len(buf) >= 9:
-        total = 9 + buf[6]
-        if len(buf) >= total and crc_ok(bytes(buf[:total])):
-            return "rtu"
+    if fc == 0x10 and len(buf) >= 7:
+        # An RTU FC16 write-to-address-0 collides with MBAP's zero proto-id, so a
+        # partially-arrived one must NOT be guessed as MBAP. Only treat it as a
+        # pending RTU frame when the header is plausibly FC16 (byte_count == 2*qty);
+        # otherwise (e.g. a real MBAP frame whose txn low byte is 0x10) fall through.
+        qty = (buf[4] << 8) | buf[5]
+        if buf[6] == 2 * qty and 1 <= qty <= 123:
+            total = 9 + buf[6]
+            if len(buf) < total:
+                return None  # wait for the full RTU frame before deciding
+            if crc_ok(bytes(buf[:total])):
+                return "rtu"
     if looks_like_mbap(buf):
         return "mbap"
     # Not a valid RTU frame and not MBAP-shaped: default to RTU so take_requests
@@ -138,10 +172,19 @@ def take_mbap_requests(buf: bytearray):
     """Pull complete MBAP requests out of ``buf`` -> list of (txn, unit, pdu)."""
     out = []
     while len(buf) >= 6:
+        # MBAP protocol-id is always 0x0000. A non-zero proto-id or an implausible
+        # length means the stream desynced (garbage) -> drop one byte to resync
+        # instead of wedging forever on a bad length (which would grow buf unbounded).
+        if buf[2] != 0 or buf[3] != 0:
+            del buf[:1]
+            continue
         length = (buf[4] << 8) | buf[5]
+        if length < 2 or length > 253:
+            del buf[:1]
+            continue
         total = 6 + length
-        if length < 2 or len(buf) < total:
-            break
+        if len(buf) < total:
+            break  # valid header, wait for the rest of the frame
         txn = (buf[0] << 8) | buf[1]
         unit = buf[6]
         pdu = bytes(buf[7:total])

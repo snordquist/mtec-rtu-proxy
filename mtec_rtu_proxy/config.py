@@ -18,6 +18,7 @@ class Config:
     dongle_host: str = "127.0.0.1"
     dongle_port: int = 502
     hero_ips: FrozenSet[str] = frozenset()
+    write_ips: FrozenSet[str] = frozenset()  # IPs allowed to send FC06/FC16 writes (empty = allow all + warn)
     txn_timeout: float = 3.0        # per-transaction upstream timeout (seconds)
     cache_ttl: float = 30.0         # how long a cached register stays servable
     reconnect_backoff: float = 3.0  # wait before reconnecting a dead upstream
@@ -31,22 +32,38 @@ class Config:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Config":
-        heroes = env.get("HERO_IPS", "")
+        def _num(key: str, default: str, cast):
+            raw = env.get(key, default)
+            try:
+                return cast(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"invalid {key}={raw!r}: expected a {cast.__name__}"
+                ) from None
+
+        def _ips(key: str) -> "FrozenSet[str]":
+            return frozenset(x.strip() for x in env.get(key, "").split(",") if x.strip())
+
         du = env.get("DONGLE_UNIT", "").strip()
+        hero_ips = _ips("HERO_IPS")
+        # Writes default to the hero(s) -- the controller is the natural writer. Add
+        # other legitimate writers (e.g. Home Assistant switches) via WRITE_IPS.
+        write_ips = _ips("WRITE_IPS") or hero_ips
         return cls(
             listen_host=env.get("LISTEN_HOST", "0.0.0.0"),
-            listen_port=int(env.get("LISTEN_PORT", "502")),
+            listen_port=_num("LISTEN_PORT", "502", int),
             dongle_host=env.get("DONGLE_HOST", "127.0.0.1"),
-            dongle_port=int(env.get("DONGLE_PORT", "502")),
-            hero_ips=frozenset(x.strip() for x in heroes.split(",") if x.strip()),
-            txn_timeout=float(env.get("TXN_TIMEOUT", "3.0")),
-            cache_ttl=float(env.get("CACHE_TTL", "30.0")),
-            reconnect_backoff=float(env.get("RECONNECT_BACKOFF", "3.0")),
-            connect_settle=float(env.get("CONNECT_SETTLE", "2.0")),
+            dongle_port=_num("DONGLE_PORT", "502", int),
+            hero_ips=hero_ips,
+            write_ips=write_ips,
+            txn_timeout=_num("TXN_TIMEOUT", "3.0", float),
+            cache_ttl=_num("CACHE_TTL", "30.0", float),
+            reconnect_backoff=_num("RECONNECT_BACKOFF", "3.0", float),
+            connect_settle=_num("CONNECT_SETTLE", "2.0", float),
             dongle_unit=int(du) if du else None,
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
-            min_request_interval=float(env.get("MIN_REQUEST_INTERVAL", "0.0")),
-            hero_cache_ttl=float(env.get("HERO_CACHE_TTL", "0.0")),
-            stats_interval=float(env.get("STATS_INTERVAL", "60.0")),
-            cache_jitter=float(env.get("CACHE_JITTER", "0.0")),
+            min_request_interval=_num("MIN_REQUEST_INTERVAL", "0.0", float),
+            hero_cache_ttl=_num("HERO_CACHE_TTL", "0.0", float),
+            stats_interval=_num("STATS_INTERVAL", "60.0", float),
+            cache_jitter=_num("CACHE_JITTER", "0.0", float),
         )

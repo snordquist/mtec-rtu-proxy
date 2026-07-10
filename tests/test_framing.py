@@ -95,6 +95,44 @@ def test_detect_dialect_rtu_read_of_addr_zero_is_not_mbap():
     assert framing.detect_dialect(rtu) == "rtu"
 
 
+def test_detect_dialect_partial_rtu_fc16_addr0_not_misread_as_mbap():
+    # RTU FC16 write 2 regs @0: start(0,0) collides with MBAP's zero proto-id. A
+    # partially-arrived frame (header only) must NOT latch to MBAP -> return None.
+    full = framing.append_crc(bytes([252, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0, 1, 0, 2]))
+    assert framing.detect_dialect(bytes(full[:8])) is None   # wait for the rest
+    assert framing.detect_dialect(full) == "rtu"             # complete + valid CRC
+
+
+def test_detect_dialect_mbap_with_txn_low_byte_0x10():
+    # A real MBAP frame whose txn low byte is 0x10 must still be detected as MBAP
+    # (not stalled waiting for a bogus RTU FC16 length).
+    frame = framing.build_mbap(0x0010, 0xFF, bytes([0x03, 0x00, 0x64, 0x00, 0x02]))
+    assert frame[1] == 0x10
+    assert framing.detect_dialect(frame) == "mbap"
+
+
+def test_take_mbap_requests_resyncs_past_garbage():
+    good = bytes.fromhex("000900000006ff0661b303e8")
+    buf = bytearray(bytes([0xAB, 0x00, 0x07]) + good)  # leading garbage (bad proto-id)
+    assert framing.take_mbap_requests(buf) == [(0x0009, 0xFF, bytes([0x06, 0x61, 0xB3, 0x03, 0xE8]))]
+
+
+def test_take_mbap_requests_drops_implausible_length():
+    # length field 0/1 must not wedge the parser (it used to break forever).
+    buf = bytearray(bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF]))
+    framing.take_mbap_requests(buf)  # must make progress, not loop
+    assert len(buf) < 7
+
+
+def test_take_requests_drops_bogus_fc16_bytecount():
+    # A stray 0x10 with byte_count != 2*qty is garbage -> drop one byte, don't stall
+    # waiting for a huge bogus frame; a following valid frame still parses.
+    good = framing.append_crc(bytes([252, 0x03, 0, 100, 0, 1]))
+    buf = bytearray(bytes([0x00, 0x10, 0x00, 0x00, 0x00, 0x02, 0xFA]) + good)
+    frames = framing.take_requests(buf)
+    assert good in frames
+
+
 def test_describe_request_and_reply():
     assert framing.describe_request(bytes([0x03, 0x80, 0xE8, 0x00, 0x01])) == "FC03 read @33000 x1"
     assert framing.describe_request(bytes([0x06, 0x61, 0xB3, 0x03, 0xE8])) == "FC06 write @25011=1000"

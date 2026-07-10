@@ -17,12 +17,16 @@ class RegisterCache:
     (including the EMS/Hero's own polls). Non-priority clients can then be
     answered from here, adding zero load to the single-master dongle.
 
-    ``jitter`` adds a random 0..jitter seconds to each write's timestamp so that
-    blocks cached together in the Hero's synchronized poll burst expire at
+    ``jitter`` back-dates each write's timestamp by a random 0..jitter seconds so
+    that blocks cached together in the Hero's synchronized poll burst expire at
     *staggered* times -- turning the sawtooth "all blocks refresh at once" load
-    spike into a steady trickle (gentler on the fragile dongle). ``rand`` is
+    spike into a steady trickle (gentler on the fragile dongle). Back-dating
+    (not forward-dating) keeps the effective TTL in ``ttl-jitter .. ttl`` so a
+    cached value is never served *older* than the configured ``ttl``. ``rand`` is
     injectable for deterministic tests.
     """
+
+    _MAX_ENTRIES = 8192  # guard against unbounded growth from a scanning/hostile client
 
     def __init__(self, ttl: float = 30.0, clock: Callable[[], float] = time.monotonic,
                  jitter: float = 0.0, rand: Callable[[], float] = random.random):
@@ -36,27 +40,46 @@ class RegisterCache:
     def update(self, start: int, regs: List[int]) -> None:
         now = self._clock()
         if self._jitter:
-            now += self._jitter * self._rand()  # stagger this block's expiry
+            now -= self._jitter * self._rand()  # back-date to stagger expiry (never extends TTL)
         for i, v in enumerate(regs):
             self._d[start + i] = (v, now)
+        if len(self._d) > self._MAX_ENTRIES:
+            self._evict_oldest()
+
+    def invalidate(self, start: int, qty: int) -> None:
+        """Drop cached entries for a written register range (post-write coherence)."""
+        for addr in range(start, start + qty):
+            self._d.pop(addr, None)
 
     def get_block(self, start: int, qty: int, max_age: Optional[float] = None) -> Optional[List[int]]:
         """Return the values if *all* requested registers are cached and fresh.
 
-        Returns ``None`` on any miss or stale entry, so the caller falls back to
-        a live read. ``max_age`` overrides the default TTL (used for the shorter
-        hero-debounce window).
+        Returns ``None`` on any miss, stale entry, or non-positive ``qty`` (a
+        qty<=0 read must fall through to a live request/exception, not become a
+        vacuous empty "hit"), so the caller falls back to a live read. ``max_age``
+        overrides the default TTL (used for the shorter hero-debounce window).
         """
+        if qty <= 0:
+            return None
         ttl = self._ttl if max_age is None else max_age
         now = self._clock()
         out: List[int] = []
         for addr in range(start, start + qty):
             entry = self._d.get(addr)
-            if entry is None or (now - entry[1]) > ttl:
+            if entry is None:
+                return None
+            if (now - entry[1]) > ttl:
+                self._d.pop(addr, None)  # purge stale entry on miss
                 return None
             out.append(entry[0])
         self.hits += 1
         return out
+
+    def _evict_oldest(self) -> None:
+        # Drop the oldest ~10% by timestamp; cheap amortised cap on dict size.
+        drop = max(1, len(self._d) // 10)
+        for addr in sorted(self._d, key=lambda a: self._d[a][1])[:drop]:
+            del self._d[addr]
 
     def __len__(self) -> int:
         return len(self._d)
