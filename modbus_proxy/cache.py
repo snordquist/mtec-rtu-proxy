@@ -14,13 +14,13 @@ class RegisterCache:
     """Maps holding-register address -> (value, timestamp).
 
     Populated as a side effect of every *live* FC03 response the proxy relays
-    (including the EMS/Hero's own polls). Non-priority clients can then be
-    answered from here, adding zero load to the single-master dongle.
+    (including the EMS/priority's own polls). Non-priority clients can then be
+    answered from here, adding zero load to the single-master upstream.
 
     ``jitter`` back-dates each write's timestamp by a random 0..jitter seconds so
-    that blocks cached together in the Hero's synchronized poll burst expire at
+    that blocks cached together in the priority's synchronized poll burst expire at
     *staggered* times -- turning the sawtooth "all blocks refresh at once" load
-    spike into a steady trickle (gentler on the fragile dongle). Back-dating
+    spike into a steady trickle (gentler on the fragile upstream). Back-dating
     (not forward-dating) keeps the effective TTL in ``ttl-jitter .. ttl`` so a
     cached value is never served *older* than the configured ``ttl``. ``rand`` is
     injectable for deterministic tests.
@@ -57,11 +57,13 @@ class RegisterCache:
         Returns ``None`` on any miss, stale entry, or non-positive ``qty`` (a
         qty<=0 read must fall through to a live request/exception, not become a
         vacuous empty "hit"), so the caller falls back to a live read. ``max_age``
-        overrides the default TTL (used for the shorter hero-debounce window).
+        overrides the default TTL (used for the shorter priority-debounce window).
         """
         if qty <= 0:
             return None
         ttl = self._ttl if max_age is None else max_age
+        if ttl <= 0:
+            return None  # caching disabled (CACHE_TTL=0) -> always a live read
         now = self._clock()
         out: List[int] = []
         for addr in range(start, start + qty):

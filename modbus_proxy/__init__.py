@@ -1,4 +1,4 @@
-"""Single-master, caching RTU-over-TCP proxy for M-TEC 'espressif' dongles."""
+"""Single-master Modbus RTU-over-TCP proxy with a dialect bridge and optional cache."""
 from .config import Config
 from .cache import RegisterCache
 from .proxy import ProxyServer, Upstream, run

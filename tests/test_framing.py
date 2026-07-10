@@ -1,4 +1,4 @@
-from mtec_rtu_proxy import framing
+from modbus_proxy import framing
 
 
 def test_crc16_known_vector():

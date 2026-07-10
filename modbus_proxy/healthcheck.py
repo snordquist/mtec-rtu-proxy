@@ -1,10 +1,10 @@
-"""Liveness probe: ``python -m mtec_rtu_proxy.healthcheck`` -> exit 0 (healthy) / 1.
+"""Liveness probe: ``python -m modbus_proxy.healthcheck`` -> exit 0 (healthy) / 1.
 
 Opens a localhost connection to the proxy and sends one FC03 read, then checks that
 *any* framed Modbus reply comes back (register data OR a gateway exception both prove
 the proxy is responsive) within a bounded time. Wired up as the Docker HEALTHCHECK so
 a wedged-but-alive process (event loop stuck, listener dead) is detected and restarted.
-It does NOT assert the dongle is up -- an exception reply still means the proxy lives.
+It does NOT assert the upstream is up -- an exception reply still means the proxy lives.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .config import Config
 
 
 async def _probe(cfg: Config, addr: int, timeout: float) -> bool:
-    unit = cfg.dongle_unit if cfg.dongle_unit is not None else 252
+    unit = cfg.upstream_unit if cfg.upstream_unit is not None else 252
     req = framing.append_crc(bytes([unit, 0x03, (addr >> 8) & 0xFF, addr & 0xFF, 0, 1]))
     reader, writer = await asyncio.open_connection("127.0.0.1", cfg.listen_port)
     try:

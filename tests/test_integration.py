@@ -3,18 +3,18 @@ and clients driven through the proxy. Each test runs its own event loop via
 ``asyncio.run`` (no pytest-asyncio dependency)."""
 import asyncio
 
-from mtec_rtu_proxy import framing
-from mtec_rtu_proxy.config import Config
-from mtec_rtu_proxy.proxy import ProxyServer
+from modbus_proxy import framing
+from modbus_proxy.config import Config
+from modbus_proxy.proxy import ProxyServer
 
 from mock_dongle import MockDongle, client_request, read_one_rtu, mbap_client_request
 
 
-def _cfg(dongle_port, **kw):
+def _cfg(upstream_port, **kw):
     base = dict(
         listen_host="127.0.0.1", listen_port=0,
-        dongle_host="127.0.0.1", dongle_port=dongle_port,
-        hero_ips=frozenset(), txn_timeout=1.0, cache_ttl=30.0,
+        upstream_host="127.0.0.1", upstream_port=upstream_port,
+        priority_ips=frozenset(), txn_timeout=1.0, cache_ttl=30.0,
         reconnect_backoff=0.2, connect_settle=0.0, stats_interval=0.0,
     )
     base.update(kw)
@@ -39,7 +39,7 @@ def test_non_priority_read_is_served_from_cache():
 
 async def _scenario_cache():
     dongle = await MockDongle({100: 11, 101: 22, 102: 33}).start()
-    proxy = await ProxyServer(_cfg(dongle.port)).start()  # hero_ips empty -> cache client
+    proxy = await ProxyServer(_cfg(dongle.port)).start()  # priority_ips empty -> cache client
     try:
         req = _fc03(252, 100, 3)
         r1 = await client_request(proxy.port, req)
@@ -62,7 +62,7 @@ def test_priority_reads_are_live_and_warm_cache():
 
 async def _scenario_hero_live():
     dongle = await MockDongle({100: 7, 101: 8}).start()
-    proxy = await ProxyServer(_cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}))).start()
+    proxy = await ProxyServer(_cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}))).start()
     try:
         req = _fc03(252, 100, 2)
         await client_request(proxy.port, req)
@@ -105,7 +105,7 @@ def test_late_reply_does_not_desync():
 async def _scenario_late_reply():
     dongle = await MockDongle({100: 55, 200: 4242}).start()
     proxy = await ProxyServer(
-        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}),
+        _cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}),
              txn_timeout=0.4, reconnect_backoff=0.1)
     ).start()
     async def read_until(addr, expect, tries=20):
@@ -145,7 +145,7 @@ def test_offbyone_desync_is_detected_and_resynced():
 async def _scenario_desync():
     dongle = await MockDongle({200: 5, 201: 6, 202: 7, 203: 8}).start()
     proxy = await ProxyServer(
-        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), reconnect_backoff=0.1)
+        _cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}), reconnect_backoff=0.1)
     ).start()
     try:
         assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 200, 2)))[1] == [5, 6]
@@ -178,7 +178,7 @@ def test_write_is_forwarded_live():
 
 async def _scenario_write():
     dongle = await MockDongle({100: 0}).start()
-    proxy = await ProxyServer(_cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}))).start()
+    proxy = await ProxyServer(_cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}))).start()
     try:
         echo = await client_request(proxy.port, _fc06(252, 100, 1234))
         assert echo == _fc06(252, 100, 1234)             # FC06 reply echoes the request
@@ -197,7 +197,7 @@ def test_bad_crc_frame_is_ignored():
 
 async def _scenario_bad_crc():
     dongle = await MockDongle({100: 99}).start()
-    proxy = await ProxyServer(_cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}))).start()
+    proxy = await ProxyServer(_cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}))).start()
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
         writer.write(bytes([252, 0x03, 0, 100, 0, 1, 0x00, 0x00]))  # broken CRC -> dropped
@@ -218,7 +218,7 @@ async def _scenario_bad_crc():
 
 def test_mute_onset_and_recovery_are_logged(caplog):
     import logging
-    caplog.set_level(logging.WARNING, logger="mtec_rtu_proxy")
+    caplog.set_level(logging.WARNING, logger="modbus_proxy")
     asyncio.run(_scenario_mute_log())
     msgs = [r.getMessage() for r in caplog.records]
     onsets = [m for m in msgs if "MUTE ONSET" in m]
@@ -233,7 +233,7 @@ def test_mute_onset_and_recovery_are_logged(caplog):
 async def _scenario_mute_log():
     dongle = await MockDongle({100: 55}).start()
     proxy = await ProxyServer(
-        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), txn_timeout=0.3, reconnect_backoff=0.1)
+        _cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}), txn_timeout=0.3, reconnect_backoff=0.1)
     ).start()
     try:
         # one healthy read populates the journal
@@ -300,7 +300,7 @@ def test_write_updates_cache_no_stale_read():
 
 async def _scenario_cache_write_coherence():
     dongle = await MockDongle({100: 0}).start()
-    # hero_ips empty -> reads are cache-served; write_ips empty -> writes allowed
+    # priority_ips empty -> reads are cache-served; write_ips empty -> writes allowed
     proxy = await ProxyServer(_cfg(dongle.port)).start()
     try:
         assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 1)))[1] == [0]
@@ -342,7 +342,7 @@ def test_healthy_path_does_not_drain():
 
 async def _scenario_no_drain():
     dongle = await MockDongle({100: 7, 101: 8}).start()
-    proxy = await ProxyServer(_cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}))).start()
+    proxy = await ProxyServer(_cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}))).start()
     try:
         for _ in range(5):
             await client_request(proxy.port, _fc03(252, 100, 2))
@@ -359,8 +359,8 @@ def test_hero_read_jumps_queued_backlog():
 
 
 async def _scenario_priority():
-    from mtec_rtu_proxy.proxy import Upstream, PRIO_HERO, PRIO_OTHER
-    from mtec_rtu_proxy.cache import RegisterCache
+    from modbus_proxy.proxy import Upstream, PRIO_HIGH, PRIO_LOW
+    from modbus_proxy.cache import RegisterCache
     dongle = await MockDongle({i: i for i in range(100, 140)}).start()
     cfg = _cfg(dongle.port)
     up = Upstream(cfg, RegisterCache(ttl=cfg.cache_ttl))
@@ -368,11 +368,11 @@ async def _scenario_priority():
     try:
         await asyncio.sleep(0.05)          # let the upstream connect
         dongle.delay_next = 0.5            # block the worker on the first in-flight reply
-        first = asyncio.create_task(up.submit(_fc03(252, 100, 1), PRIO_OTHER))
+        first = asyncio.create_task(up.submit(_fc03(252, 100, 1), PRIO_LOW))
         await asyncio.sleep(0.05)          # worker now busy on `first`
-        lows = [asyncio.create_task(up.submit(_fc03(252, 110 + i, 1), PRIO_OTHER)) for i in range(5)]
+        lows = [asyncio.create_task(up.submit(_fc03(252, 110 + i, 1), PRIO_LOW)) for i in range(5)]
         await asyncio.sleep(0.02)
-        hero = asyncio.create_task(up.submit(_fc03(252, 130, 1), PRIO_HERO))
+        hero = asyncio.create_task(up.submit(_fc03(252, 130, 1), PRIO_HIGH))
         await asyncio.gather(first, *lows, hero)
         starts = [s for (_fc, s) in dongle.requests]
         assert starts[0] == 100            # the in-flight request
@@ -396,7 +396,7 @@ def test_reconnect_after_socket_death():
 async def _scenario_socket_death():
     dongle = await MockDongle({100: 55}).start()
     proxy = await ProxyServer(
-        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), txn_timeout=0.4, reconnect_backoff=0.1)
+        _cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}), txn_timeout=0.4, reconnect_backoff=0.1)
     ).start()
     try:
         assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 1)))[1] == [55]
@@ -427,7 +427,7 @@ def test_mbap_client_read_bridged_to_rtu_dongle():
 async def _scenario_mbap_read():
     dongle = await MockDongle({200: 4711, 201: 42}).start()
     # loopback treated as hero (live); force unit 252 upstream like the real setup
-    cfg = _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), dongle_unit=252)
+    cfg = _cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}), upstream_unit=252)
     proxy = await ProxyServer(cfg).start()
     try:
         pdu = bytes([0x03, 0x00, 0xC8, 0x00, 0x02])  # FC03 read addr 200 (0x00C8), qty 2
@@ -449,7 +449,7 @@ def test_mbap_client_write_bridged_to_rtu_dongle():
 
 async def _scenario_mbap_write():
     dongle = await MockDongle({}).start()
-    cfg = _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), dongle_unit=252)
+    cfg = _cfg(dongle.port, priority_ips=frozenset({"127.0.0.1"}), upstream_unit=252)
     proxy = await ProxyServer(cfg).start()
     try:
         # exactly the Hero's captured write: FC06 reg 0x61B3=25011 value 1000, unit 255

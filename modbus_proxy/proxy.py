@@ -1,23 +1,24 @@
 """Single-master, caching RTU-over-TCP proxy.
 
-Design goals (why generic Modbus-TCP proxies fail against the M-TEC dongle):
+Design goals (why generic Modbus-TCP proxies fail against single-master
+RTU-over-TCP devices):
 
-1. **Correct RTU framing.** The dongle speaks RTU-over-TCP; replies are framed
+1. **Correct RTU framing.** The upstream speaks RTU-over-TCP; replies are framed
    here by function code (FC03 by byte-count, exceptions = 3 bytes after the
    header), never by an MBAP length field.
 
-2. **Exactly one persistent upstream connection.** The dongle tolerates only a
+2. **Exactly one persistent upstream connection.** The upstream tolerates only a
    single Modbus master. All clients are multiplexed onto one serialized
-   upstream worker, so the dongle never sees more than one connection.
+   upstream worker, so the upstream never sees more than one connection.
 
 3. **No reconnect churn.** On a *transient* per-transaction timeout the upstream
    socket is drained and kept alive (a fresh reconnect would be refused by the
-   single-master dongle). It reconnects only on a real socket death, with
+   single-master upstream). It reconnects only on a real socket death, with
    backoff.
 
-4. **Priority + cache.** Hero/EMS clients get priority and always read live, so
+4. **Priority + cache.** priority/EMS clients get priority and always read live, so
    control is never stale. Everyone else is answered from the register cache
-   for FC03 reads (zero extra dongle load) and only falls through to a live read
+   for FC03 reads (zero extra upstream load) and only falls through to a live read
    on a cache miss. Writes are always forwarded live.
 """
 from __future__ import annotations
@@ -33,14 +34,14 @@ from . import framing
 from .cache import RegisterCache
 from .config import Config
 
-log = logging.getLogger("mtec_rtu_proxy")
+log = logging.getLogger("modbus_proxy")
 
-PRIO_HERO = 0
-PRIO_OTHER = 10
+PRIO_HIGH = 0
+PRIO_LOW = 10
 
 
 class Upstream:
-    """Owns THE single persistent connection to the dongle + a serialized queue."""
+    """Owns THE single persistent connection to the upstream + a serialized queue."""
 
     def __init__(self, config: Config, cache: RegisterCache):
         self.cfg = config
@@ -106,18 +107,18 @@ class Upstream:
     async def _connect(self) -> None:
         while True:
             try:
-                log.info("connecting to dongle %s:%s", self.cfg.dongle_host, self.cfg.dongle_port)
+                log.info("connecting to upstream %s:%s", self.cfg.upstream_host, self.cfg.upstream_port)
                 self.reader, self.writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.cfg.dongle_host, self.cfg.dongle_port),
+                    asyncio.open_connection(self.cfg.upstream_host, self.cfg.upstream_port),
                     self.cfg.txn_timeout + 2,
                 )
                 self._connections += 1
                 if self.cfg.connect_settle:
                     await asyncio.sleep(self.cfg.connect_settle)
-                log.info("connected to dongle (total connects=%d)", self._connections)
+                log.info("connected to upstream (total connects=%d)", self._connections)
                 return
             except Exception as e:  # noqa: BLE001 - retry any connect failure
-                log.error("dongle connect failed: %r; backoff %.1fs", e, self.cfg.reconnect_backoff)
+                log.error("upstream connect failed: %r; backoff %.1fs", e, self.cfg.reconnect_backoff)
                 await asyncio.sleep(self.cfg.reconnect_backoff)
 
     async def _read_reply(self) -> bytes:
@@ -156,7 +157,7 @@ class Upstream:
 
         Reads until the stream has been silent for ``quiet`` seconds. In an aligned
         stream there are none. Draining (instead of reconnecting) realigns the stream
-        WITHOUT the connection churn that agitates the fragile dongle. A larger
+        WITHOUT the connection churn that agitates the fragile upstream. A larger
         ``quiet`` (used after a timeout) gives an in-flight late reply time to arrive
         so it can be discarded rather than mispaired with the next request.
         """
@@ -183,7 +184,7 @@ class Upstream:
             _prio, _seq, req, fut = await self.q.get()
             if fut.done():
                 # The client already gave up (its wait_for elapsed) -> don't spend one
-                # of the single-master dongle's scarce transaction slots on it.
+                # of the single-master upstream's scarce transaction slots on it.
                 continue
             if self.writer is None or self.writer.is_closing():
                 await self._connect()
@@ -191,7 +192,7 @@ class Upstream:
             # non-blocking peek lets us skip the drain (no per-request latency tax).
             # After a timeout/anomaly, drain until quiet so an in-flight late reply is
             # discarded here instead of being mispaired with THIS request -- without a
-            # reconnect (churn agitates the fragile dongle).
+            # reconnect (churn agitates the fragile upstream).
             if self._needs_resync:
                 self.n_drain += await self._drain_stale(quiet=min(self.cfg.txn_timeout, 0.5))
                 self._needs_resync = False
@@ -212,7 +213,7 @@ class Upstream:
                     self._journal.append((t0, desc, "badcrc", dt))
                     self._needs_resync = True  # drain before the next request
                     if not fut.done():
-                        fut.set_exception(IOError("bad CRC from dongle"))
+                        fut.set_exception(IOError("bad CRC from upstream"))
                 elif not framing.reply_matches(req, reply):
                     # off-by-one desync: valid frame, wrong request. Realign by draining
                     # before the next request instead of reconnecting (no churn).
@@ -230,7 +231,7 @@ class Upstream:
                         fut.set_result(reply)
             except asyncio.TimeoutError:
                 # No reply in time. Keep the connection -- reconnect churn agitates the
-                # fragile dongle. Mark the stream dirty so the next request drains any
+                # fragile upstream. Mark the stream dirty so the next request drains any
                 # in-flight late reply (quiet-window) before trusting a reply again.
                 self.n_timeout += 1
                 self._needs_resync = True
@@ -259,7 +260,7 @@ class Upstream:
             _, regs = framing.parse_fc03_response(reply)
             self.cache.update(start, regs)
         elif fc == 0x06 and len(req) >= 6:
-            # write single: the echoed write confirms the dongle now holds this value
+            # write single: the echoed write confirms the upstream now holds this value
             addr = (req[2] << 8) | req[3]
             self.cache.update(addr, [(req[4] << 8) | req[5]])
         elif fc == 0x10 and len(req) >= 7:
@@ -279,7 +280,7 @@ class Upstream:
         return await fut
 
     async def aclose(self) -> None:
-        """Close the upstream socket so the dongle sees EOF (clean shutdown)."""
+        """Close the upstream socket so the upstream sees EOF (clean shutdown)."""
         w, self.writer, self.reader = self.writer, None, None
         if w is not None:
             try:
@@ -300,7 +301,7 @@ def _client_timeout(cfg: Config) -> float:
     return cfg.txn_timeout * 2 + 2.0
 
 
-async def serve(frame: bytes, is_hero: bool, up: Upstream, cache: RegisterCache,
+async def serve(frame: bytes, is_priority: bool, up: Upstream, cache: RegisterCache,
                 cfg: Config, client: str = "") -> bytes:
     fc = frame[1]
     req = framing.rtu_pdu(frame)
@@ -308,16 +309,16 @@ async def serve(frame: bytes, is_hero: bool, up: Upstream, cache: RegisterCache,
         _, start, qty = framing.parse_fc03_request(frame)
         if not (1 <= qty <= 125):  # FC03 quantity limit -> illegal data value
             return framing.build_exception(frame[0], fc, 0x03)
-        # FC03 reads: HA from cache always; hero only within the debounce window (if enabled).
-        if not is_hero or cfg.hero_cache_ttl > 0:
-            cached = cache.get_block(start, qty, max_age=(cfg.hero_cache_ttl if is_hero else None))
+        # FC03 reads: HA from cache always; priority only within the debounce window (if enabled).
+        if not is_priority or cfg.priority_cache_ttl > 0:
+            cached = cache.get_block(start, qty, max_age=(cfg.priority_cache_ttl if is_priority else None))
             if cached is not None:
                 log.debug("%s rtu %s -> CACHE %s", client, framing.describe_request(req), cached)
                 return framing.build_fc03_response(frame[0], cached)
     elif fc in (0x06, 0x10) and not _write_allowed(cfg, client):
         log.warning("write from %s rejected: not in WRITE_IPS", client)
         return framing.build_exception(frame[0], fc, 0x01)  # illegal function (unauthorized)
-    priority = PRIO_HERO if is_hero else PRIO_OTHER
+    priority = PRIO_HIGH if is_priority else PRIO_LOW
     try:
         reply = await asyncio.wait_for(up.submit(frame, priority), _client_timeout(cfg))
         log.debug("%s rtu %s -> %s", client, framing.describe_request(req),
@@ -328,23 +329,23 @@ async def serve(frame: bytes, is_hero: bool, up: Upstream, cache: RegisterCache,
         return framing.build_exception(frame[0], fc, 0x0B)  # 0x0B = target failed to respond
 
 
-async def serve_mbap(txn: int, unit: int, pdu: bytes, is_hero: bool,
+async def serve_mbap(txn: int, unit: int, pdu: bytes, is_priority: bool,
                      up: Upstream, cache: RegisterCache, cfg: Config, client: str = "") -> bytes:
-    """Serve a Modbus/TCP (MBAP) client by bridging to the RTU dongle.
+    """Serve a Modbus/TCP (MBAP) client by bridging to the RTU upstream.
 
     Translates MBAP -> RTU (adds CRC, optional unit override), submits on the
     single upstream, then wraps the RTU reply back into MBAP (echoing the txn).
     """
     fc = pdu[0]
-    send_unit = cfg.dongle_unit if cfg.dongle_unit is not None else unit
+    send_unit = cfg.upstream_unit if cfg.upstream_unit is not None else unit
     if fc == 0x03 and len(pdu) >= 5:
         start = (pdu[1] << 8) | pdu[2]
         qty = (pdu[3] << 8) | pdu[4]
         if not (1 <= qty <= 125):  # FC03 quantity limit -> illegal data value
             return framing.build_mbap(txn, unit, bytes([fc | 0x80, 0x03]))
-        # FC03 reads: HA from cache always; hero only within the debounce window (if enabled).
-        if not is_hero or cfg.hero_cache_ttl > 0:
-            cached = cache.get_block(start, qty, max_age=(cfg.hero_cache_ttl if is_hero else None))
+        # FC03 reads: HA from cache always; priority only within the debounce window (if enabled).
+        if not is_priority or cfg.priority_cache_ttl > 0:
+            cached = cache.get_block(start, qty, max_age=(cfg.priority_cache_ttl if is_priority else None))
             if cached is not None:
                 body = bytes([0x03, qty * 2]) + struct.pack(">%dH" % len(cached), *cached)
                 log.debug("%s mbap %s -> CACHE %s", client, framing.describe_request(pdu), cached)
@@ -352,7 +353,7 @@ async def serve_mbap(txn: int, unit: int, pdu: bytes, is_hero: bool,
     elif fc in (0x06, 0x10) and not _write_allowed(cfg, client):
         log.warning("write from %s rejected: not in WRITE_IPS", client)
         return framing.build_mbap(txn, unit, bytes([fc | 0x80, 0x01]))  # illegal function
-    priority = PRIO_HERO if is_hero else PRIO_OTHER
+    priority = PRIO_HIGH if is_priority else PRIO_LOW
     rtu_req = framing.append_crc(bytes([send_unit]) + pdu)
     try:
         rtu_reply = await asyncio.wait_for(up.submit(rtu_req, priority), _client_timeout(cfg))
@@ -367,7 +368,7 @@ async def serve_mbap(txn: int, unit: int, pdu: bytes, is_hero: bool,
 async def handle_client(reader, writer, up: Upstream, cache: RegisterCache, cfg: Config) -> None:
     peer = writer.get_extra_info("peername")
     peer_ip = peer[0] if peer else "?"
-    is_hero = peer_ip in cfg.hero_ips
+    is_priority = peer_ip in cfg.priority_ips
     buf = bytearray()
     dialect = None
     try:
@@ -381,14 +382,14 @@ async def handle_client(reader, writer, up: Upstream, cache: RegisterCache, cfg:
                 if dialect is None:
                     continue  # need more bytes to decide
                 log.info("client %s (%s, %s)", peer_ip,
-                         "HERO/live" if is_hero else "cache", dialect)
+                         "priority/live" if is_priority else "cache", dialect)
             if dialect == "mbap":
                 for txn, unit, pdu in framing.take_mbap_requests(buf):
-                    writer.write(await serve_mbap(txn, unit, pdu, is_hero, up, cache, cfg, peer_ip))
+                    writer.write(await serve_mbap(txn, unit, pdu, is_priority, up, cache, cfg, peer_ip))
                     await writer.drain()
             else:
                 for frame in framing.take_requests(buf):
-                    reply = await serve(frame, is_hero, up, cache, cfg, peer_ip)
+                    reply = await serve(frame, is_priority, up, cache, cfg, peer_ip)
                     if reply:
                         writer.write(reply)
                         await writer.drain()
@@ -465,7 +466,7 @@ class ProxyServer:
             await self._server.serve_forever()
 
     async def stop(self) -> None:
-        # Stop the worker first, then close the upstream so the dongle sees EOF
+        # Stop the worker first, then close the upstream so the upstream sees EOF
         # (Server.wait_closed() blocks on live connections on Python 3.13+).
         # Drop the supervisor callback so a cancel here is not treated as a crash.
         if self._worker is not None:
@@ -484,16 +485,16 @@ class ProxyServer:
 
 
 async def run(cfg: Config) -> None:
-    if not cfg.hero_ips:
-        log.warning("HERO_IPS is empty: NO client gets live/priority reads -- every read "
+    if not cfg.priority_ips:
+        log.warning("PRIORITY_IPS is empty: NO client gets live/priority reads -- every read "
                     "is served from cache (a controller would act on stale data)")
     if not cfg.write_ips:
         log.warning("WRITE_IPS is empty: FC06/FC16 writes are accepted from ANY client -- "
                     "set WRITE_IPS to restrict who may command the inverter")
     srv = await ProxyServer(cfg).start()
     log.info(
-        "RTU caching proxy on %s:%s -> dongle %s:%s (heroes=%s, writers=%s)",
-        cfg.listen_host, cfg.listen_port, cfg.dongle_host, cfg.dongle_port,
-        sorted(cfg.hero_ips), sorted(cfg.write_ips) or "ALL",
+        "RTU caching proxy on %s:%s -> upstream %s:%s (priority=%s, writers=%s)",
+        cfg.listen_host, cfg.listen_port, cfg.upstream_host, cfg.upstream_port,
+        sorted(cfg.priority_ips), sorted(cfg.write_ips) or "ALL",
     )
     await srv.serve_forever()

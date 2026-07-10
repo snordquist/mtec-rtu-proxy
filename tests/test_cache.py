@@ -1,4 +1,4 @@
-from mtec_rtu_proxy.cache import RegisterCache
+from modbus_proxy.cache import RegisterCache
 
 
 def test_update_and_get_block():

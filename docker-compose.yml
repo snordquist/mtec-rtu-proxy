@@ -1,8 +1,8 @@
 services:
-  mtec-rtu-proxy:
+  modbus-rtu-tcp-proxy:
     build: .
-    image: mtec-rtu-proxy:local
-    container_name: mtec-rtu-proxy
+    image: modbus-rtu-tcp-proxy:local
+    container_name: modbus-rtu-tcp-proxy
     restart: unless-stopped
     env_file: .env
     ports:

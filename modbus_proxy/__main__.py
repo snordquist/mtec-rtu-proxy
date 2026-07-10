@@ -1,4 +1,4 @@
-"""Entry point: ``python -m mtec_rtu_proxy`` (config from environment)."""
+"""Entry point: ``python -m modbus_proxy`` (config from environment)."""
 from __future__ import annotations
 
 import asyncio

@@ -1,9 +1,9 @@
 """Modbus RTU-over-TCP framing helpers.
 
-The M-TEC "espressif" dongle speaks Modbus **RTU framed over a raw TCP stream**
-(unit-id + PDU + CRC16), *not* Modbus/TCP (which prepends a 7-byte MBAP header
-and carries no CRC). Getting this wrong is the single biggest reason generic
-Modbus-TCP proxies fail against this dongle.
+Many cheap WiFi/serial Modbus gateways speak Modbus **RTU framed over a raw TCP
+stream** (unit-id + PDU + CRC16), *not* Modbus/TCP (which prepends a 7-byte MBAP
+header and carries no CRC). Getting this wrong is the single biggest reason
+generic Modbus-TCP proxies fail against such a device.
 
 Everything in this module is a pure function so it can be unit-tested without
 any I/O.
@@ -120,9 +120,9 @@ def take_requests(buf: bytearray) -> List[bytes]:
 
 # --- Modbus/TCP (MBAP) support -------------------------------------------------
 #
-# Some clients (e.g. the M-TEC EnergyHero EMS) speak Modbus/TCP (MBAP header,
-# no CRC), while the espressif dongle speaks RTU-over-TCP. The proxy bridges the
-# two: MBAP request -> RTU request to the dongle -> RTU reply -> MBAP reply.
+# Some clients (e.g. many EMS controllers) speak Modbus/TCP (MBAP header, no CRC),
+# while the upstream device speaks RTU-over-TCP. The proxy bridges the two:
+# MBAP request -> RTU request to the device -> RTU reply -> MBAP reply.
 #
 # MBAP frame layout: txn(2) proto(2, =0) length(2) unit(1) pdu(length-1)
 #   where pdu = function code + data (no CRC).
