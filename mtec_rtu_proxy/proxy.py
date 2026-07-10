@@ -82,15 +82,14 @@ class Upstream:
             return head + await self.reader.readexactly(6)
         return head + await self.reader.readexactly(4)  # unknown: best effort
 
-    async def _drain(self) -> None:
-        """Discard any late/stale bytes after a timeout WITHOUT closing the socket."""
+    def _drop(self) -> None:
+        """Close the upstream socket; the next request reconnects a clean stream."""
         try:
-            while True:
-                data = await asyncio.wait_for(self.reader.read(256), 0.2)
-                if not data:
-                    break
-        except asyncio.TimeoutError:
+            if self.writer:
+                self.writer.close()
+        except Exception:
             pass
+        self.reader = self.writer = None
 
     async def worker(self) -> None:
         await self._connect()
@@ -109,9 +108,11 @@ class Upstream:
                 elif not fut.done():
                     fut.set_exception(IOError("bad CRC from dongle"))
             except asyncio.TimeoutError:
-                # KEY: resync, do NOT tear down the single upstream on a transient miss
-                log.warning("txn timeout -> draining (upstream kept alive)")
-                await self._drain()
+                # RTU has no transaction ids: a late reply arriving after the timeout
+                # would shift every subsequent read (permanent desync). The only safe
+                # resync is to drop the socket so the next request reconnects clean.
+                log.warning("txn timeout -> dropping upstream to resync")
+                self._drop()
                 if not fut.done():
                     fut.set_exception(asyncio.TimeoutError())
             except Exception as e:  # noqa: BLE001 - real socket death -> reconnect

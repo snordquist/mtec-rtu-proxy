@@ -27,7 +27,8 @@ class MockDongle:
         self.total_connections = 0
         self.concurrent = 0
         self.max_concurrent = 0
-        self.drop_next = 0  # simulate this many missing replies (timeouts)
+        self.drop_next = 0    # simulate this many missing replies (timeouts)
+        self.delay_next = 0.0  # delay the next reply by this many seconds (late reply)
         self._server: Optional[asyncio.AbstractServer] = None
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> "MockDongle":
@@ -56,7 +57,7 @@ class MockDongle:
                 buf += data
                 for frame in framing.take_requests(buf):
                     await self._respond(frame, writer)
-        except (ConnectionResetError, asyncio.IncompleteReadError):
+        except (ConnectionResetError, asyncio.IncompleteReadError, BrokenPipeError, OSError):
             pass
         finally:
             self.concurrent -= 1
@@ -70,6 +71,11 @@ class MockDongle:
         if self.drop_next > 0:
             self.drop_next -= 1
             return  # no reply -> the proxy will time out on this transaction
+        if self.delay_next > 0:
+            delay, self.delay_next = self.delay_next, 0.0
+            await asyncio.sleep(delay)  # late reply: arrives after the proxy timed out
+            if writer.is_closing():
+                return  # proxy already dropped the socket -> late reply discarded
         unit = frame[0]
         fc = frame[1]
         if fc == 0x03:

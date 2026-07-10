@@ -93,30 +93,44 @@ async def _scenario_single_master():
         await dongle.stop()
 
 
-# --- a transient timeout drains, it does NOT tear down + reconnect ---------
+# --- a LATE reply after a timeout must NOT desync subsequent reads ---------
+# This is the real-world failure: RTU has no transaction ids, so a reply that
+# arrives after the proxy gave up would shift every following read by one frame.
+# The proxy must drop+reconnect the upstream to guarantee a clean resync.
 
-def test_transient_timeout_keeps_upstream_alive():
-    asyncio.run(_scenario_drain())
+def test_late_reply_does_not_desync():
+    asyncio.run(_scenario_late_reply())
 
 
-async def _scenario_drain():
-    dongle = await MockDongle({100: 55}).start()
+async def _scenario_late_reply():
+    dongle = await MockDongle({100: 55, 200: 4242}).start()
     proxy = await ProxyServer(
-        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), txn_timeout=0.5)
+        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}),
+             txn_timeout=0.4, reconnect_backoff=0.1)
     ).start()
+    async def read_until(addr, expect, tries=20):
+        # after a reconnect the single-master dongle may briefly refuse; retry.
+        # CRUCIAL: this only ever succeeds if the register returns its OWN value
+        # (a desynced/shifted late reply would return the wrong value forever).
+        for _ in range(tries):
+            r = await client_request(proxy.port, _fc03(252, addr, 1), timeout=4)
+            if len(r) >= 5 and r[1] == 0x03 and framing.parse_fc03_response(r)[1] == [expect]:
+                return True
+            await asyncio.sleep(0.2)
+        return False
+
     try:
-        r0 = await client_request(proxy.port, _fc03(252, 100, 1))
-        assert framing.parse_fc03_response(r0)[1] == [55]
-        assert dongle.total_connections == 1
+        assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 1)))[1] == [55]
+        conns_before = dongle.total_connections
 
-        dongle.drop_next = 1  # next transaction gets no reply -> proxy times out
-        r1 = await client_request(proxy.port, _fc03(252, 100, 1), timeout=3)
-        assert r1[1] == 0x83 and r1[2] == 0x0B           # gateway "target failed" exception
-        assert dongle.total_connections == 1             # upstream drained, NOT reconnected
+        dongle.delay_next = 0.8  # reply for the next read arrives after the 0.4s timeout
+        r1 = await client_request(proxy.port, _fc03(252, 200, 1), timeout=4)
+        assert r1[1] == 0x83  # timed-out txn -> gateway exception to the client
 
-        r2 = await client_request(proxy.port, _fc03(252, 100, 1))  # recovers on same socket
-        assert framing.parse_fc03_response(r2)[1] == [55]
-        assert dongle.total_connections == 1
+        # subsequent reads must return the CORRECT registers, not a shifted late reply
+        assert await read_until(100, 55)
+        assert await read_until(200, 4242)
+        assert dongle.total_connections > conns_before  # resynced by reconnecting
     finally:
         await proxy.stop()
         await dongle.stop()
