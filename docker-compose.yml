@@ -7,3 +7,8 @@ services:
     env_file: .env
     ports:
       - "${LISTEN_PORT:-502}:${LISTEN_PORT:-502}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
