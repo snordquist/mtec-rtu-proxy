@@ -93,3 +93,10 @@ def test_detect_dialect_rtu_read_of_addr_zero_is_not_mbap():
     # bytes 2:4 are 00 00 (like MBAP) but the CRC is valid -> must be classified RTU
     rtu = framing.append_crc(bytes([252, 0x03, 0x00, 0x00, 0x00, 0x03]))
     assert framing.detect_dialect(rtu) == "rtu"
+
+
+def test_describe_request_and_reply():
+    assert framing.describe_request(bytes([0x03, 0x80, 0xE8, 0x00, 0x01])) == "FC03 read @33000 x1"
+    assert framing.describe_request(bytes([0x06, 0x61, 0xB3, 0x03, 0xE8])) == "FC06 write @25011=1000"
+    assert framing.describe_reply(bytes([0x03, 0x02, 0x24, 0xFE])) == "FC03 -> [9470]"
+    assert framing.describe_reply(bytes([0x83, 0x0B])) == "EXCEPTION fc03 code=0x0B"

@@ -160,3 +160,31 @@ def build_mbap(txn: int, unit: int, pdu: bytes) -> bytes:
 def rtu_pdu(frame: bytes) -> bytes:
     """Extract the PDU (function code + data) from an RTU frame (unit+pdu+crc)."""
     return frame[1:-2]
+
+
+# --- human-readable decoding for debug logging --------------------------------
+
+def describe_request(pdu: bytes) -> str:
+    """One-line summary of a request PDU (function code + data)."""
+    fc = pdu[0] if pdu else 0
+    if fc == 0x03 and len(pdu) >= 5:
+        return f"FC03 read @{(pdu[1] << 8) | pdu[2]} x{(pdu[3] << 8) | pdu[4]}"
+    if fc == 0x06 and len(pdu) >= 5:
+        return f"FC06 write @{(pdu[1] << 8) | pdu[2]}={(pdu[3] << 8) | pdu[4]}"
+    if fc == 0x10 and len(pdu) >= 5:
+        return f"FC16 write @{(pdu[1] << 8) | pdu[2]} x{(pdu[3] << 8) | pdu[4]}"
+    return f"FC{fc:02X}({pdu.hex()})"
+
+
+def describe_reply(pdu: bytes) -> str:
+    """One-line summary of a reply PDU (function code + data)."""
+    fc = pdu[0] if pdu else 0
+    if fc & 0x80:
+        return f"EXCEPTION fc{fc & 0x7F:02X} code=0x{pdu[1]:02X}" if len(pdu) > 1 else "EXCEPTION"
+    if fc == 0x03 and len(pdu) >= 2:
+        bc = pdu[1]
+        regs = [(pdu[2 + 2 * i] << 8) | pdu[3 + 2 * i] for i in range(bc // 2)]
+        return f"FC03 -> {regs}"
+    if fc in (0x06, 0x10):
+        return f"FC{fc:02X} ok"
+    return f"FC{fc:02X}({pdu.hex()})"

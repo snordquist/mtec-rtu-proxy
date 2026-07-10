@@ -23,6 +23,9 @@ class Config:
     reconnect_backoff: float = 3.0  # wait before reconnecting a dead upstream
     connect_settle: float = 2.0     # pause after connect before first request
     dongle_unit: Optional[int] = None  # force this Modbus unit id upstream (None = pass client's through)
+    log_level: str = "INFO"            # set DEBUG to log every request/reply with decoded values
+    min_request_interval: float = 0.0  # min seconds between upstream requests (0 = no throttle)
+    hero_cache_ttl: float = 0.0        # if >0, also serve hero reads from cache within this window (debounce)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Config":
@@ -39,4 +42,7 @@ class Config:
             reconnect_backoff=float(env.get("RECONNECT_BACKOFF", "3.0")),
             connect_settle=float(env.get("CONNECT_SETTLE", "2.0")),
             dongle_unit=int(du) if du else None,
+            log_level=env.get("LOG_LEVEL", "INFO").upper(),
+            min_request_interval=float(env.get("MIN_REQUEST_INTERVAL", "0.0")),
+            hero_cache_ttl=float(env.get("HERO_CACHE_TTL", "0.0")),
         )

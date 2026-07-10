@@ -27,17 +27,19 @@ class RegisterCache:
         for i, v in enumerate(regs):
             self._d[start + i] = (v, now)
 
-    def get_block(self, start: int, qty: int) -> Optional[List[int]]:
+    def get_block(self, start: int, qty: int, max_age: Optional[float] = None) -> Optional[List[int]]:
         """Return the values if *all* requested registers are cached and fresh.
 
         Returns ``None`` on any miss or stale entry, so the caller falls back to
-        a live read.
+        a live read. ``max_age`` overrides the default TTL (used for the shorter
+        hero-debounce window).
         """
+        ttl = self._ttl if max_age is None else max_age
         now = self._clock()
         out: List[int] = []
         for addr in range(start, start + qty):
             entry = self._d.get(addr)
-            if entry is None or (now - entry[1]) > self._ttl:
+            if entry is None or (now - entry[1]) > ttl:
                 return None
             out.append(entry[0])
         return out

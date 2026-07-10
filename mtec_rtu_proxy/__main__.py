@@ -9,12 +9,13 @@ from .proxy import run
 
 
 def main() -> None:
+    cfg = Config.from_env()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, cfg.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        asyncio.run(run(Config.from_env()))
+        asyncio.run(run(cfg))
     except KeyboardInterrupt:
         pass
 

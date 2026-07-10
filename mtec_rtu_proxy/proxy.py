@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from . import framing
@@ -47,6 +48,7 @@ class Upstream:
         self.q: "asyncio.PriorityQueue" = asyncio.PriorityQueue()
         self._seq = 0
         self._connections = 0  # total successful upstream connects (tests assert on this)
+        self._last_txn = 0.0   # monotonic time of the last upstream write (for throttling)
 
     @property
     def connection_count(self) -> int:
@@ -97,6 +99,11 @@ class Upstream:
             _prio, _seq, req, fut = await self.q.get()
             if self.writer is None or self.writer.is_closing():
                 await self._connect()
+            if self.cfg.min_request_interval > 0:  # throttle: pace upstream requests
+                wait = self.cfg.min_request_interval - (time.monotonic() - self._last_txn)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            self._last_txn = time.monotonic()
             try:
                 self.writer.write(req)
                 await self.writer.drain()
@@ -154,24 +161,30 @@ class Upstream:
                 pass
 
 
-async def serve(frame: bytes, is_hero: bool, up: Upstream, cache: RegisterCache) -> bytes:
+async def serve(frame: bytes, is_hero: bool, up: Upstream, cache: RegisterCache,
+                cfg: Config, client: str = "") -> bytes:
     fc = frame[1]
-    # Non-priority FC03 reads are answered from cache -> zero dongle load.
-    if fc == 0x03 and not is_hero:
+    req = framing.rtu_pdu(frame)
+    # FC03 reads: HA from cache always; hero only within the debounce window (if enabled).
+    if fc == 0x03 and (not is_hero or cfg.hero_cache_ttl > 0):
         _, start, qty = framing.parse_fc03_request(frame)
-        cached = cache.get_block(start, qty)
+        cached = cache.get_block(start, qty, max_age=(cfg.hero_cache_ttl if is_hero else None))
         if cached is not None:
+            log.debug("%s rtu %s -> CACHE %s", client, framing.describe_request(req), cached)
             return framing.build_fc03_response(frame[0], cached)
-        # cache miss -> fall through to a (low-priority) live read that warms it
     priority = PRIO_HERO if is_hero else PRIO_OTHER
     try:
-        return await up.submit(frame, priority)
+        reply = await up.submit(frame, priority)
+        log.debug("%s rtu %s -> %s", client, framing.describe_request(req),
+                  framing.describe_reply(framing.rtu_pdu(reply)))
+        return reply
     except Exception:  # noqa: BLE001 - surface as a Modbus gateway exception
+        log.debug("%s rtu %s -> TIMEOUT/ERR", client, framing.describe_request(req))
         return framing.build_exception(frame[0], fc, 0x0B)  # 0x0B = target failed to respond
 
 
 async def serve_mbap(txn: int, unit: int, pdu: bytes, is_hero: bool,
-                     up: Upstream, cache: RegisterCache, cfg: Config) -> bytes:
+                     up: Upstream, cache: RegisterCache, cfg: Config, client: str = "") -> bytes:
     """Serve a Modbus/TCP (MBAP) client by bridging to the RTU dongle.
 
     Translates MBAP -> RTU (adds CRC, optional unit override), submits on the
@@ -179,22 +192,26 @@ async def serve_mbap(txn: int, unit: int, pdu: bytes, is_hero: bool,
     """
     fc = pdu[0]
     send_unit = cfg.dongle_unit if cfg.dongle_unit is not None else unit
-    # non-priority FC03 reads may be served from cache (zero dongle load)
-    if fc == 0x03 and not is_hero and len(pdu) >= 5:
+    # FC03 reads: HA from cache always; hero only within the debounce window (if enabled).
+    if fc == 0x03 and len(pdu) >= 5 and (not is_hero or cfg.hero_cache_ttl > 0):
         start = (pdu[1] << 8) | pdu[2]
         qty = (pdu[3] << 8) | pdu[4]
-        cached = cache.get_block(start, qty)
+        cached = cache.get_block(start, qty, max_age=(cfg.hero_cache_ttl if is_hero else None))
         if cached is not None:
             body = bytes([0x03, qty * 2])
             for v in cached:
                 body += bytes([(v >> 8) & 0xFF, v & 0xFF])
+            log.debug("%s mbap %s -> CACHE %s", client, framing.describe_request(pdu), cached)
             return framing.build_mbap(txn, unit, body)
     priority = PRIO_HERO if is_hero else PRIO_OTHER
     rtu_req = framing.append_crc(bytes([send_unit]) + pdu)
     try:
         rtu_reply = await up.submit(rtu_req, priority)
+        log.debug("%s mbap %s -> %s", client, framing.describe_request(pdu),
+                  framing.describe_reply(framing.rtu_pdu(rtu_reply)))
         return framing.build_mbap(txn, unit, framing.rtu_pdu(rtu_reply))
     except Exception:  # noqa: BLE001 - surface as a Modbus gateway exception
+        log.debug("%s mbap %s -> TIMEOUT/ERR", client, framing.describe_request(pdu))
         return framing.build_mbap(txn, unit, bytes([fc | 0x80, 0x0B]))
 
 
@@ -218,11 +235,11 @@ async def handle_client(reader, writer, up: Upstream, cache: RegisterCache, cfg:
                          "HERO/live" if is_hero else "cache", dialect)
             if dialect == "mbap":
                 for txn, unit, pdu in framing.take_mbap_requests(buf):
-                    writer.write(await serve_mbap(txn, unit, pdu, is_hero, up, cache, cfg))
+                    writer.write(await serve_mbap(txn, unit, pdu, is_hero, up, cache, cfg, peer_ip))
                     await writer.drain()
             else:
                 for frame in framing.take_requests(buf):
-                    reply = await serve(frame, is_hero, up, cache)
+                    reply = await serve(frame, is_hero, up, cache, cfg, peer_ip)
                     if reply:
                         writer.write(reply)
                         await writer.drain()
