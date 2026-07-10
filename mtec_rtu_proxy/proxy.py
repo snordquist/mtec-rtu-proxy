@@ -99,6 +99,21 @@ class Upstream:
             _prio, _seq, req, fut = await self.q.get()
             if self.writer is None or self.writer.is_closing():
                 await self._connect()
+            # Resync guard: in an aligned stream there are NO pending bytes before we
+            # send a request. Any leftover (a stale/duplicate/late reply) means the
+            # stream has shifted -> reconnect. This catches off-by-one desync even for
+            # same-length reads, which reply_matches() cannot distinguish.
+            if self.reader is not None:
+                try:
+                    stale = await asyncio.wait_for(self.reader.read(256), 0.02)
+                except asyncio.TimeoutError:
+                    stale = b""
+                except Exception:  # noqa: BLE001
+                    stale = b""
+                if stale:
+                    log.warning("stale %d bytes before request -> reconnect to resync", len(stale))
+                    self._drop()
+                    await self._connect()
             if self.cfg.min_request_interval > 0:  # throttle: pace upstream requests
                 wait = self.cfg.min_request_interval - (time.monotonic() - self._last_txn)
                 if wait > 0:

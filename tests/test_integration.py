@@ -143,29 +143,30 @@ def test_offbyone_desync_is_detected_and_resynced():
 
 
 async def _scenario_desync():
-    dongle = await MockDongle({100: 11, 101: 22, 200: 5, 201: 6, 202: 7, 203: 8, 204: 9}).start()
+    dongle = await MockDongle({200: 5, 201: 6, 202: 7, 203: 8}).start()
     proxy = await ProxyServer(
         _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), reconnect_backoff=0.1)
     ).start()
     try:
-        assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 2)))[1] == [11, 22]
+        assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 200, 2)))[1] == [5, 6]
         conns = dongle.total_connections
 
-        # duplicate the next reply -> a leftover frame shifts the stream by one
+        # duplicate the reply -> a leftover [5,6] frame shifts the stream by one
         dongle.duplicate_next = 1
-        await client_request(proxy.port, _fc03(252, 100, 2))  # its own reply ok; a copy is left over
+        await client_request(proxy.port, _fc03(252, 200, 2))  # own reply ok; a copy is left over
 
-        # a different-shaped read now hits the leftover (2 regs != expected 5) -> desync detected
-        async def read_until(addr, qty, expect, tries=15):
+        # SAME-shaped read of a DIFFERENT block: the leftover [5,6] has the right length,
+        # so ONLY the pre-request resync guard (not reply_matches) can catch this off-by-one.
+        async def read_until(addr, expect, tries=15):
             for _ in range(tries):
-                r = await client_request(proxy.port, _fc03(252, addr, qty), timeout=4)
+                r = await client_request(proxy.port, _fc03(252, addr, 2), timeout=4)
                 if len(r) >= 5 and r[1] == 0x03 and framing.parse_fc03_response(r)[1] == expect:
                     return True
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.1)
             return False
 
-        assert await read_until(200, 5, [5, 6, 7, 8, 9])
-        assert dongle.total_connections > conns  # reconnected to resync
+        assert await read_until(202, [7, 8])          # must return 202's OWN values, not [5,6]
+        assert dongle.total_connections > conns        # resynced via reconnect
     finally:
         await proxy.stop()
         await dongle.stop()
