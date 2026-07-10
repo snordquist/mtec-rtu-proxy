@@ -165,23 +165,62 @@ async def serve(frame: bytes, is_hero: bool, up: Upstream, cache: RegisterCache)
         return framing.build_exception(frame[0], fc, 0x0B)  # 0x0B = target failed to respond
 
 
+async def serve_mbap(txn: int, unit: int, pdu: bytes, is_hero: bool,
+                     up: Upstream, cache: RegisterCache, cfg: Config) -> bytes:
+    """Serve a Modbus/TCP (MBAP) client by bridging to the RTU dongle.
+
+    Translates MBAP -> RTU (adds CRC, optional unit override), submits on the
+    single upstream, then wraps the RTU reply back into MBAP (echoing the txn).
+    """
+    fc = pdu[0]
+    send_unit = cfg.dongle_unit if cfg.dongle_unit is not None else unit
+    # non-priority FC03 reads may be served from cache (zero dongle load)
+    if fc == 0x03 and not is_hero and len(pdu) >= 5:
+        start = (pdu[1] << 8) | pdu[2]
+        qty = (pdu[3] << 8) | pdu[4]
+        cached = cache.get_block(start, qty)
+        if cached is not None:
+            body = bytes([0x03, qty * 2])
+            for v in cached:
+                body += bytes([(v >> 8) & 0xFF, v & 0xFF])
+            return framing.build_mbap(txn, unit, body)
+    priority = PRIO_HERO if is_hero else PRIO_OTHER
+    rtu_req = framing.append_crc(bytes([send_unit]) + pdu)
+    try:
+        rtu_reply = await up.submit(rtu_req, priority)
+        return framing.build_mbap(txn, unit, framing.rtu_pdu(rtu_reply))
+    except Exception:  # noqa: BLE001 - surface as a Modbus gateway exception
+        return framing.build_mbap(txn, unit, bytes([fc | 0x80, 0x0B]))
+
+
 async def handle_client(reader, writer, up: Upstream, cache: RegisterCache, cfg: Config) -> None:
     peer = writer.get_extra_info("peername")
     peer_ip = peer[0] if peer else "?"
     is_hero = peer_ip in cfg.hero_ips
-    log.info("client %s (%s)", peer_ip, "HERO/live" if is_hero else "cache")
     buf = bytearray()
+    dialect = None
     try:
         while True:
             data = await reader.read(256)
             if not data:
                 break
             buf += data
-            for frame in framing.take_requests(buf):
-                reply = await serve(frame, is_hero, up, cache)
-                if reply:
-                    writer.write(reply)
+            if dialect is None:
+                dialect = framing.detect_dialect(buf)
+                if dialect is None:
+                    continue  # need more bytes to decide
+                log.info("client %s (%s, %s)", peer_ip,
+                         "HERO/live" if is_hero else "cache", dialect)
+            if dialect == "mbap":
+                for txn, unit, pdu in framing.take_mbap_requests(buf):
+                    writer.write(await serve_mbap(txn, unit, pdu, is_hero, up, cache, cfg))
                     await writer.drain()
+            else:
+                for frame in framing.take_requests(buf):
+                    reply = await serve(frame, is_hero, up, cache)
+                    if reply:
+                        writer.write(reply)
+                        await writer.drain()
     except (ConnectionResetError, asyncio.IncompleteReadError, BrokenPipeError):
         pass
     finally:

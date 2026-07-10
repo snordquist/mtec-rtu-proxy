@@ -90,3 +90,73 @@ def take_requests(buf: bytearray) -> List[bytes]:
         else:
             del buf[:1]  # unknown function code -> resync
     return out
+
+
+# --- Modbus/TCP (MBAP) support -------------------------------------------------
+#
+# Some clients (e.g. the M-TEC EnergyHero EMS) speak Modbus/TCP (MBAP header,
+# no CRC), while the espressif dongle speaks RTU-over-TCP. The proxy bridges the
+# two: MBAP request -> RTU request to the dongle -> RTU reply -> MBAP reply.
+#
+# MBAP frame layout: txn(2) proto(2, =0) length(2) unit(1) pdu(length-1)
+#   where pdu = function code + data (no CRC).
+
+
+def looks_like_mbap(buf: bytes) -> bool:
+    """Heuristic: MBAP has protocol-id 0x0000 at bytes 2:4 and a plausible length.
+
+    Only trust this AFTER ruling out a valid-CRC RTU frame (see ``detect_dialect``);
+    it disambiguates the rare RTU-read-of-address-0 case.
+    """
+    if len(buf) < 8:
+        return False
+    if buf[2] != 0 or buf[3] != 0:
+        return False
+    length = (buf[4] << 8) | buf[5]
+    return 2 <= length <= 253
+
+
+def detect_dialect(buf: bytes):
+    """Return 'rtu', 'mbap' or None (need more bytes) for a client's first frame."""
+    if len(buf) < 8:
+        return None
+    fc = buf[1]
+    if fc in (0x03, 0x06) and crc_ok(bytes(buf[:8])):
+        return "rtu"
+    if fc == 0x10 and len(buf) >= 9:
+        total = 9 + buf[6]
+        if len(buf) >= total and crc_ok(bytes(buf[:total])):
+            return "rtu"
+    if looks_like_mbap(buf):
+        return "mbap"
+    # Not a valid RTU frame and not MBAP-shaped: default to RTU so take_requests
+    # can resync past leading garbage/bad-CRC bytes (never latches on nothing).
+    return "rtu"
+
+
+def take_mbap_requests(buf: bytearray):
+    """Pull complete MBAP requests out of ``buf`` -> list of (txn, unit, pdu)."""
+    out = []
+    while len(buf) >= 6:
+        length = (buf[4] << 8) | buf[5]
+        total = 6 + length
+        if length < 2 or len(buf) < total:
+            break
+        txn = (buf[0] << 8) | buf[1]
+        unit = buf[6]
+        pdu = bytes(buf[7:total])
+        del buf[:total]
+        out.append((txn, unit, pdu))
+    return out
+
+
+def build_mbap(txn: int, unit: int, pdu: bytes) -> bytes:
+    """Wrap a PDU (function code + data, no CRC) in an MBAP header."""
+    length = 1 + len(pdu)
+    return bytes([(txn >> 8) & 0xFF, txn & 0xFF, 0, 0,
+                  (length >> 8) & 0xFF, length & 0xFF, unit]) + pdu
+
+
+def rtu_pdu(frame: bytes) -> bytes:
+    """Extract the PDU (function code + data) from an RTU frame (unit+pdu+crc)."""
+    return frame[1:-2]

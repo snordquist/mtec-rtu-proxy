@@ -7,7 +7,7 @@ from mtec_rtu_proxy import framing
 from mtec_rtu_proxy.config import Config
 from mtec_rtu_proxy.proxy import ProxyServer
 
-from mock_dongle import MockDongle, client_request, read_one_rtu
+from mock_dongle import MockDongle, client_request, read_one_rtu, mbap_client_request
 
 
 def _cfg(dongle_port, **kw):
@@ -159,6 +159,51 @@ async def _scenario_bad_crc():
         reply = await asyncio.wait_for(read_one_rtu(reader), 3)
         assert framing.parse_fc03_response(reply)[1] == [99]
         writer.close()
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+# --- an MBAP client (EnergyHero) is bridged to the RTU dongle --------------
+
+def test_mbap_client_read_bridged_to_rtu_dongle():
+    asyncio.run(_scenario_mbap_read())
+
+
+async def _scenario_mbap_read():
+    dongle = await MockDongle({200: 4711, 201: 42}).start()
+    # loopback treated as hero (live); force unit 252 upstream like the real setup
+    cfg = _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), dongle_unit=252)
+    proxy = await ProxyServer(cfg).start()
+    try:
+        pdu = bytes([0x03, 0x00, 0xC8, 0x00, 0x02])  # FC03 read addr 200 (0x00C8), qty 2
+        reply = await mbap_client_request(proxy.port, txn=0x0009, unit=255, pdu=pdu)
+        assert reply[0:2] == bytes([0x00, 0x09])     # txn echoed
+        assert reply[6] == 255                       # client's unit echoed back
+        assert reply[7] == 0x03                      # FC03
+        bc = reply[8]
+        vals = [(reply[9 + 2 * i] << 8) | reply[10 + 2 * i] for i in range(bc // 2)]
+        assert vals == [4711, 42]                    # real data bridged through
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
+def test_mbap_client_write_bridged_to_rtu_dongle():
+    asyncio.run(_scenario_mbap_write())
+
+
+async def _scenario_mbap_write():
+    dongle = await MockDongle({}).start()
+    cfg = _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), dongle_unit=252)
+    proxy = await ProxyServer(cfg).start()
+    try:
+        # exactly the Hero's captured write: FC06 reg 0x61B3=25011 value 1000, unit 255
+        wpdu = bytes([0x06, 0x61, 0xB3, 0x03, 0xE8])
+        reply = await mbap_client_request(proxy.port, txn=0x000A, unit=255, pdu=wpdu)
+        assert reply[7] == 0x06                        # FC06 echoed
+        assert reply[8:12] == bytes([0x61, 0xB3, 0x03, 0xE8])
+        assert dongle.registers.get(25011) == 1000     # write reached the dongle
     finally:
         await proxy.stop()
         await dongle.stop()

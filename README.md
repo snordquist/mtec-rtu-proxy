@@ -36,6 +36,11 @@ This proxy fixes both and adds a read-through cache:
   answered from the **register cache** for reads — adding *zero* load to the
   dongle — and only falls through to a live read on a cache miss. Writes are
   always forwarded live.
+- **Dialect bridge.** Clients may speak either RTU-over-TCP *or* Modbus/TCP
+  (MBAP). The M-TEC EnergyHero EMS speaks MBAP (and often unit id 255) while the
+  dongle and Home Assistant speak RTU-over-TCP (unit 252). The proxy detects each
+  client's dialect and translates transparently to the dongle's RTU framing
+  (optionally normalising the unit id via `DONGLE_UNIT`).
 
 ```
    EMS / Hero  ─┐   priority, always live
@@ -58,6 +63,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `CACHE_TTL`         | `30`        | How long a cached register stays servable (s)                  |
 | `RECONNECT_BACKOFF` | `3.0`       | Wait before reconnecting a genuinely dead upstream (s)         |
 | `CONNECT_SETTLE`    | `2.0`       | Pause after connecting before the first request (s)            |
+| `DONGLE_UNIT`       | *(unset)*   | Force this Modbus unit id upstream (e.g. `252`); unset = pass through |
 
 No hosts, IPs or credentials are baked into the code.
 

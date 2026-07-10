@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import FrozenSet, Mapping
+from typing import FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -22,10 +22,12 @@ class Config:
     cache_ttl: float = 30.0         # how long a cached register stays servable
     reconnect_backoff: float = 3.0  # wait before reconnecting a dead upstream
     connect_settle: float = 2.0     # pause after connect before first request
+    dongle_unit: Optional[int] = None  # force this Modbus unit id upstream (None = pass client's through)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Config":
         heroes = env.get("HERO_IPS", "")
+        du = env.get("DONGLE_UNIT", "").strip()
         return cls(
             listen_host=env.get("LISTEN_HOST", "0.0.0.0"),
             listen_port=int(env.get("LISTEN_PORT", "502")),
@@ -36,4 +38,5 @@ class Config:
             cache_ttl=float(env.get("CACHE_TTL", "30.0")),
             reconnect_backoff=float(env.get("RECONNECT_BACKOFF", "3.0")),
             connect_settle=float(env.get("CONNECT_SETTLE", "2.0")),
+            dongle_unit=int(du) if du else None,
         )

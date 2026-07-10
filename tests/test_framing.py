@@ -66,3 +66,30 @@ def test_take_requests_resyncs_after_garbage():
     buf = bytearray(bytes([252, 0x03, 0, 100, 0, 1, 0x00, 0x00]) + good)  # bad-CRC frame + good
     frames = framing.take_requests(buf)
     assert good in frames
+
+
+# --- MBAP / dialect detection (EnergyHero speaks Modbus/TCP) -------------------
+
+def test_mbap_build_matches_real_hero_frame():
+    # Exactly the frame captured from the EnergyHero: FC06 write reg 0x61B3=1000, unit 255
+    frame = framing.build_mbap(0x0009, 0xFF, bytes([0x06, 0x61, 0xB3, 0x03, 0xE8]))
+    assert frame == bytes.fromhex("000900000006ff0661b303e8")
+
+
+def test_take_mbap_requests_roundtrip():
+    frame = bytes.fromhex("000900000006ff0661b303e8")
+    buf = bytearray(frame)
+    assert framing.take_mbap_requests(buf) == [(0x0009, 0xFF, bytes([0x06, 0x61, 0xB3, 0x03, 0xE8]))]
+    assert len(buf) == 0
+
+
+def test_detect_dialect_rtu_vs_mbap():
+    rtu = framing.append_crc(bytes([252, 0x03, 0x00, 0x64, 0x00, 0x03]))
+    assert framing.detect_dialect(rtu) == "rtu"
+    assert framing.detect_dialect(bytes.fromhex("000900000006ff0661b303e8")) == "mbap"
+
+
+def test_detect_dialect_rtu_read_of_addr_zero_is_not_mbap():
+    # bytes 2:4 are 00 00 (like MBAP) but the CRC is valid -> must be classified RTU
+    rtu = framing.append_crc(bytes([252, 0x03, 0x00, 0x00, 0x00, 0x03]))
+    assert framing.detect_dialect(rtu) == "rtu"

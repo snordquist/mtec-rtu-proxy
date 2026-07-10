@@ -113,11 +113,36 @@ async def read_one_rtu(reader: asyncio.StreamReader) -> bytes:
 
 
 async def client_request(port: int, frame: bytes, host: str = "127.0.0.1", timeout: float = 5.0) -> bytes:
-    """Open a connection, send one request, read one reply, close."""
+    """Open a connection, send one RTU request, read one reply, close."""
     reader, writer = await asyncio.open_connection(host, port)
     try:
         writer.write(frame)
         await writer.drain()
         return await asyncio.wait_for(read_one_rtu(reader), timeout)
+    finally:
+        writer.close()
+
+
+# --- Modbus/TCP (MBAP) client, mimicking the EnergyHero -----------------------
+
+def build_mbap(txn: int, unit: int, pdu: bytes) -> bytes:
+    length = 1 + len(pdu)
+    return bytes([(txn >> 8) & 0xFF, txn & 0xFF, 0, 0,
+                  (length >> 8) & 0xFF, length & 0xFF, unit]) + pdu
+
+
+async def read_one_mbap(reader: asyncio.StreamReader) -> bytes:
+    head = await reader.readexactly(6)            # txn(2) proto(2) length(2)
+    length = (head[4] << 8) | head[5]
+    return head + await reader.readexactly(length)
+
+
+async def mbap_client_request(port: int, txn: int, unit: int, pdu: bytes,
+                              host: str = "127.0.0.1", timeout: float = 5.0) -> bytes:
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(build_mbap(txn, unit, pdu))
+        await writer.drain()
+        return await asyncio.wait_for(read_one_mbap(reader), timeout)
     finally:
         writer.close()
