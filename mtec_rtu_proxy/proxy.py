@@ -111,10 +111,14 @@ class Upstream:
                 # RTU has no transaction ids: a late reply arriving after the timeout
                 # would shift every subsequent read (permanent desync). The only safe
                 # resync is to drop the socket so the next request reconnects clean.
-                log.warning("txn timeout -> dropping upstream to resync")
+                # Back off before reconnecting so a mute/flapping dongle is left in
+                # peace instead of being hammered (which historically made it worse).
+                log.warning("txn timeout -> dropping upstream to resync (backoff %.1fs)",
+                            self.cfg.reconnect_backoff)
                 self._drop()
                 if not fut.done():
                     fut.set_exception(asyncio.TimeoutError())
+                await asyncio.sleep(self.cfg.reconnect_backoff)
             except Exception as e:  # noqa: BLE001 - real socket death -> reconnect
                 log.error("upstream error %r -> reconnect with backoff", e)
                 try:
