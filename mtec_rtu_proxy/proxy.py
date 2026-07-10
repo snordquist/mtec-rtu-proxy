@@ -293,7 +293,7 @@ class ProxyServer:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache = RegisterCache(ttl=cfg.cache_ttl)
+        self.cache = RegisterCache(ttl=cfg.cache_ttl, jitter=cfg.cache_jitter)
         self.up = Upstream(cfg, self.cache)
         self._server: Optional[asyncio.AbstractServer] = None
         self._worker: Optional[asyncio.Task] = None

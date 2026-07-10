@@ -27,6 +27,7 @@ class Config:
     min_request_interval: float = 0.0  # min seconds between upstream requests (0 = no throttle)
     hero_cache_ttl: float = 0.0        # if >0, also serve hero reads from cache within this window (debounce)
     stats_interval: float = 60.0       # log a stats summary every N seconds (0 = off)
+    cache_jitter: float = 0.0          # random 0..N s added per cache write to de-sync block expiries
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Config":
@@ -47,4 +48,5 @@ class Config:
             min_request_interval=float(env.get("MIN_REQUEST_INTERVAL", "0.0")),
             hero_cache_ttl=float(env.get("HERO_CACHE_TTL", "0.0")),
             stats_interval=float(env.get("STATS_INTERVAL", "60.0")),
+            cache_jitter=float(env.get("CACHE_JITTER", "0.0")),
         )
