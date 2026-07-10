@@ -26,6 +26,7 @@ class Config:
     log_level: str = "INFO"            # set DEBUG to log every request/reply with decoded values
     min_request_interval: float = 0.0  # min seconds between upstream requests (0 = no throttle)
     hero_cache_ttl: float = 0.0        # if >0, also serve hero reads from cache within this window (debounce)
+    stats_interval: float = 60.0       # log a stats summary every N seconds (0 = off)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Config":
@@ -45,4 +46,5 @@ class Config:
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
             min_request_interval=float(env.get("MIN_REQUEST_INTERVAL", "0.0")),
             hero_cache_ttl=float(env.get("HERO_CACHE_TTL", "0.0")),
+            stats_interval=float(env.get("STATS_INTERVAL", "60.0")),
         )

@@ -15,7 +15,7 @@ def _cfg(dongle_port, **kw):
         listen_host="127.0.0.1", listen_port=0,
         dongle_host="127.0.0.1", dongle_port=dongle_port,
         hero_ips=frozenset(), txn_timeout=1.0, cache_ttl=30.0,
-        reconnect_backoff=0.2, connect_settle=0.0,
+        reconnect_backoff=0.2, connect_settle=0.0, stats_interval=0.0,
     )
     base.update(kw)
     return Config(**base)
@@ -130,7 +130,7 @@ async def _scenario_late_reply():
         # subsequent reads must return the CORRECT registers, not a shifted late reply
         assert await read_until(100, 55)
         assert await read_until(200, 4242)
-        assert dongle.total_connections > conns_before  # resynced by reconnecting
+        assert dongle.total_connections == conns_before  # resynced by DRAINING, no reconnect
     finally:
         await proxy.stop()
         await dongle.stop()
@@ -166,7 +166,7 @@ async def _scenario_desync():
             return False
 
         assert await read_until(202, [7, 8])          # must return 202's OWN values, not [5,6]
-        assert dongle.total_connections > conns        # resynced via reconnect
+        assert dongle.total_connections == conns       # resynced by DRAINING, no reconnect churn
     finally:
         await proxy.stop()
         await dongle.stop()

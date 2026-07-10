@@ -21,6 +21,7 @@ class RegisterCache:
         self._ttl = ttl
         self._clock = clock
         self._d: Dict[int, Tuple[int, float]] = {}
+        self.hits = 0  # stats: number of reads served from cache
 
     def update(self, start: int, regs: List[int]) -> None:
         now = self._clock()
@@ -42,6 +43,7 @@ class RegisterCache:
             if entry is None or (now - entry[1]) > ttl:
                 return None
             out.append(entry[0])
+        self.hits += 1
         return out
 
     def __len__(self) -> int:

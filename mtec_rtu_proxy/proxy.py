@@ -49,6 +49,9 @@ class Upstream:
         self._seq = 0
         self._connections = 0  # total successful upstream connects (tests assert on this)
         self._last_txn = 0.0   # monotonic time of the last upstream write (for throttling)
+        self.n_live = 0        # stats: successful live reads/writes
+        self.n_timeout = 0     # stats: transaction timeouts
+        self.n_drain = 0       # stats: total stale bytes drained (resyncs)
 
     @property
     def connection_count(self) -> int:
@@ -93,27 +96,40 @@ class Upstream:
             pass
         self.reader = self.writer = None
 
+    async def _drain_stale(self) -> int:
+        """Discard bytes waiting on the upstream (a stale/late/duplicate reply).
+
+        In an aligned stream there are none. Draining (instead of reconnecting)
+        realigns the stream WITHOUT the connection churn that agitates the fragile
+        dongle. Catches off-by-one desync of any length.
+        """
+        if self.reader is None:
+            return 0
+        drained = 0
+        try:
+            while True:
+                data = await asyncio.wait_for(self.reader.read(256), 0.03)
+                if not data:  # EOF: peer closed -> next write triggers a reconnect
+                    break
+                drained += len(data)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+        if drained:
+            log.warning("drained %d stale bytes to resync (no reconnect)", drained)
+        return drained
+
     async def worker(self) -> None:
         await self._connect()
         while True:
             _prio, _seq, req, fut = await self.q.get()
             if self.writer is None or self.writer.is_closing():
                 await self._connect()
-            # Resync guard: in an aligned stream there are NO pending bytes before we
-            # send a request. Any leftover (a stale/duplicate/late reply) means the
-            # stream has shifted -> reconnect. This catches off-by-one desync even for
-            # same-length reads, which reply_matches() cannot distinguish.
-            if self.reader is not None:
-                try:
-                    stale = await asyncio.wait_for(self.reader.read(256), 0.02)
-                except asyncio.TimeoutError:
-                    stale = b""
-                except Exception:  # noqa: BLE001
-                    stale = b""
-                if stale:
-                    log.warning("stale %d bytes before request -> reconnect to resync", len(stale))
-                    self._drop()
-                    await self._connect()
+            # Resync guard: an aligned stream has NO pending bytes before a request.
+            # Drain any leftover (stale/duplicate/late reply) to realign -- without a
+            # reconnect. Catches off-by-one desync of any length, no connection churn.
+            self.n_drain += await self._drain_stale()
             if self.cfg.min_request_interval > 0:  # throttle: pace upstream requests
                 wait = self.cfg.min_request_interval - (time.monotonic() - self._last_txn)
                 if wait > 0:
@@ -126,30 +142,26 @@ class Upstream:
                 if not framing.crc_ok(reply):
                     if not fut.done():
                         fut.set_exception(IOError("bad CRC from dongle"))
+                    self.n_drain += await self._drain_stale()
                 elif not framing.reply_matches(req, reply):
-                    # off-by-one desync: a valid frame but for the wrong request.
-                    # RTU has no txn id, so drop the socket to force a clean resync.
-                    log.warning("reply/request mismatch (RTU desync) -> dropping upstream to resync")
-                    self._drop()
+                    # off-by-one desync: valid frame, wrong request. Drain to realign
+                    # instead of reconnecting (no churn).
+                    log.warning("reply/request mismatch (RTU desync) -> draining to resync")
                     if not fut.done():
                         fut.set_exception(IOError("desync"))
-                    await asyncio.sleep(self.cfg.reconnect_backoff)
+                    self.n_drain += await self._drain_stale()
                 else:
+                    self.n_live += 1
                     self._cache_from(req, reply)
                     if not fut.done():
                         fut.set_result(reply)
             except asyncio.TimeoutError:
-                # RTU has no transaction ids: a late reply arriving after the timeout
-                # would shift every subsequent read (permanent desync). The only safe
-                # resync is to drop the socket so the next request reconnects clean.
-                # Back off before reconnecting so a mute/flapping dongle is left in
-                # peace instead of being hammered (which historically made it worse).
-                log.warning("txn timeout -> dropping upstream to resync (backoff %.1fs)",
-                            self.cfg.reconnect_backoff)
-                self._drop()
+                # No reply in time. Keep the connection -- reconnect churn agitates the
+                # fragile dongle. A late reply is drained by the next request's resync
+                # guard; reply_matches() catches any resulting shift.
+                self.n_timeout += 1
                 if not fut.done():
                     fut.set_exception(asyncio.TimeoutError())
-                await asyncio.sleep(self.cfg.reconnect_backoff)
             except Exception as e:  # noqa: BLE001 - real socket death -> reconnect
                 log.error("upstream error %r -> reconnect with backoff", e)
                 try:
@@ -285,15 +297,29 @@ class ProxyServer:
         self.up = Upstream(cfg, self.cache)
         self._server: Optional[asyncio.AbstractServer] = None
         self._worker: Optional[asyncio.Task] = None
+        self._stats_task: Optional[asyncio.Task] = None
 
     async def start(self) -> "ProxyServer":
         self._worker = asyncio.create_task(self.up.worker())
+        if self.cfg.stats_interval > 0:
+            self._stats_task = asyncio.create_task(self._stats_loop())
         self._server = await asyncio.start_server(
             lambda r, w: handle_client(r, w, self.up, self.cache, self.cfg),
             self.cfg.listen_host,
             self.cfg.listen_port,
         )
         return self
+
+    async def _stats_loop(self) -> None:
+        last = (0, 0, 0, 0, 0)
+        while True:
+            await asyncio.sleep(self.cfg.stats_interval)
+            cur = (self.cache.hits, self.up.n_live, self.up.n_timeout,
+                   self.up.n_drain, self.up.connection_count)
+            d = [c - p for c, p in zip(cur, last)]
+            last = cur
+            log.info("stats(%.0fs): cache_hits=%d live=%d timeouts=%d drained_bytes=%d reconnects=%d",
+                     self.cfg.stats_interval, d[0], d[1], d[2], d[3], d[4])
 
     @property
     def port(self) -> int:
@@ -308,12 +334,13 @@ class ProxyServer:
     async def stop(self) -> None:
         # Stop the worker first, then close the upstream so the dongle sees EOF
         # (Server.wait_closed() blocks on live connections on Python 3.13+).
-        if self._worker is not None:
-            self._worker.cancel()
-            try:
-                await self._worker
-            except asyncio.CancelledError:
-                pass
+        for task in (self._worker, self._stats_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         await self.up.aclose()
         if self._server is not None:
             self._server.close()
