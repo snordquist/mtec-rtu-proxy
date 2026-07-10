@@ -212,6 +212,49 @@ async def _scenario_bad_crc():
         await dongle.stop()
 
 
+# --- a mute (dropped replies) logs ONSET once + RECOVERY summary -----------
+# This is the weekend-diagnostics hook: prove the transition into a dongle mute
+# is logged with lead-in context, and recovery is logged once when it heals.
+
+def test_mute_onset_and_recovery_are_logged(caplog):
+    import logging
+    caplog.set_level(logging.WARNING, logger="mtec_rtu_proxy")
+    asyncio.run(_scenario_mute_log())
+    msgs = [r.getMessage() for r in caplog.records]
+    onsets = [m for m in msgs if "MUTE ONSET" in m]
+    recovers = [m for m in msgs if "MUTE RECOVERED" in m]
+    assert len(onsets) == 1, msgs           # onset logged exactly once per streak
+    assert "trail:" in onsets[0]            # lead-in context is dumped
+    assert len(recovers) == 1, msgs         # recovery logged once when it heals
+    assert "timeouts=" in onsets[0]  or "livereq_1s" in onsets[0]
+
+
+async def _scenario_mute_log():
+    dongle = await MockDongle({100: 55}).start()
+    proxy = await ProxyServer(
+        _cfg(dongle.port, hero_ips=frozenset({"127.0.0.1"}), txn_timeout=0.3, reconnect_backoff=0.1)
+    ).start()
+    try:
+        # one healthy read populates the journal
+        assert framing.parse_fc03_response(await client_request(proxy.port, _fc03(252, 100, 1)))[1] == [55]
+        # drop the next 3 replies -> a mute streak of timeouts
+        dongle.drop_next = 3
+        for _ in range(3):
+            r = await client_request(proxy.port, _fc03(252, 100, 1), timeout=4)
+            assert r[1] == 0x83  # gateway exception while muted
+        # replies resume -> recovery
+        for _ in range(15):
+            r = await client_request(proxy.port, _fc03(252, 100, 1), timeout=4)
+            if len(r) >= 5 and r[1] == 0x03 and framing.parse_fc03_response(r)[1] == [55]:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise AssertionError("dongle never recovered")
+    finally:
+        await proxy.stop()
+        await dongle.stop()
+
+
 # --- an MBAP client (EnergyHero) is bridged to the RTU dongle --------------
 
 def test_mbap_client_read_bridged_to_rtu_dongle():

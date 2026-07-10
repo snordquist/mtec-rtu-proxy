@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from typing import Optional
 
 from . import framing
@@ -52,10 +53,53 @@ class Upstream:
         self.n_live = 0        # stats: successful live reads/writes
         self.n_timeout = 0     # stats: transaction timeouts
         self.n_drain = 0       # stats: total stale bytes drained (resyncs)
+        # --- mute diagnostics: ring buffer of recent transactions so we can dump
+        # the lead-in (load spike? latency creep? a write?) at the FIRST timeout of
+        # a mute streak, and summarise on recovery. Only transitions log -> quiet.
+        self._journal: "deque" = deque(maxlen=80)  # (t0, desc, outcome, latency_s)
+        self._to_streak = 0    # consecutive timeouts (0 = healthy)
+        self._mute_start = 0.0
 
     @property
     def connection_count(self) -> int:
         return self._connections
+
+    @staticmethod
+    def _req_desc(req: bytes) -> str:
+        """Compact request label: R<addr>:<qty> read, W<addr>=<val> write."""
+        if len(req) < 6:
+            return "??"
+        fc, a, v = req[1], (req[2] << 8) | req[3], (req[4] << 8) | req[5]
+        if fc == 0x03:
+            return f"R{a}:{v}"
+        if fc == 0x06:
+            return f"W{a}={v}"
+        if fc == 0x10:
+            return f"W{a}:{v}n"
+        return f"fc{fc:#x}@{a}"
+
+    def _note_ok(self, desc: str) -> None:
+        if self._to_streak:
+            log.warning("MUTE RECOVERED after %.1fs / %d timeouts; first-ok=%s",
+                        time.monotonic() - self._mute_start, self._to_streak, desc)
+            self._to_streak = 0
+
+    def _note_timeout(self, desc: str, t0: float) -> None:
+        if self._to_streak == 0:  # onset: dump the lead-in ONCE per mute streak
+            self._mute_start = t0
+            r1 = sum(1 for e in self._journal if t0 - e[0] <= 1.0)
+            r5 = sum(1 for e in self._journal if t0 - e[0] <= 5.0)
+            w3 = [e[1] for e in self._journal if t0 - e[0] <= 3.0 and e[1].startswith("W")]
+            def _fmt(e):
+                age = t0 - e[0]
+                return (f"-{age:.1f}s {e[1]} {e[3] * 1000:.0f}ms" if e[2] == "ok"
+                        else f"-{age:.1f}s {e[1]} {e[2]}")
+            trail = " | ".join(_fmt(e) for e in list(self._journal)[-12:])
+            log.warning(
+                "MUTE ONSET hung=%s qdepth=%d livereq_1s=%d livereq_5s=%d writes_3s=%s | trail: %s",
+                desc, self.q.qsize(), r1, r5, (",".join(w3) or "none"), trail,
+            )
+        self._to_streak += 1
 
     async def _connect(self) -> None:
         while True:
@@ -134,12 +178,15 @@ class Upstream:
                 wait = self.cfg.min_request_interval - (time.monotonic() - self._last_txn)
                 if wait > 0:
                     await asyncio.sleep(wait)
-            self._last_txn = time.monotonic()
+            t0 = self._last_txn = time.monotonic()
+            desc = self._req_desc(req)
             try:
                 self.writer.write(req)
                 await self.writer.drain()
                 reply = await asyncio.wait_for(self._read_reply(), self.cfg.txn_timeout)
+                dt = time.monotonic() - t0
                 if not framing.crc_ok(reply):
+                    self._journal.append((t0, desc, "badcrc", dt))
                     if not fut.done():
                         fut.set_exception(IOError("bad CRC from dongle"))
                     self.n_drain += await self._drain_stale()
@@ -147,11 +194,14 @@ class Upstream:
                     # off-by-one desync: valid frame, wrong request. Drain to realign
                     # instead of reconnecting (no churn).
                     log.warning("reply/request mismatch (RTU desync) -> draining to resync")
+                    self._journal.append((t0, desc, "desync", dt))
                     if not fut.done():
                         fut.set_exception(IOError("desync"))
                     self.n_drain += await self._drain_stale()
                 else:
                     self.n_live += 1
+                    self._journal.append((t0, desc, "ok", dt))
+                    self._note_ok(desc)
                     self._cache_from(req, reply)
                     if not fut.done():
                         fut.set_result(reply)
@@ -160,6 +210,8 @@ class Upstream:
                 # fragile dongle. A late reply is drained by the next request's resync
                 # guard; reply_matches() catches any resulting shift.
                 self.n_timeout += 1
+                self._journal.append((t0, desc, "TIMEOUT", self.cfg.txn_timeout))
+                self._note_timeout(desc, t0)
                 if not fut.done():
                     fut.set_exception(asyncio.TimeoutError())
             except Exception as e:  # noqa: BLE001 - real socket death -> reconnect
